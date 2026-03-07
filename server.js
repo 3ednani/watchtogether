@@ -833,9 +833,10 @@ app.get('/proxy', (req, res) => {
     console.log('Proxy via MediaFlow:', targetUrl.substring(0, 80));
   }
 
-  const proxyReq = fetchClient.get(fetchUrl, { headers: MEDIAFLOW_URL ? {} : proxyHeaders }, (proxyRes) => {
+  const fetchHeaders = MEDIAFLOW_URL ? { 'Accept-Encoding': 'identity' } : proxyHeaders;
+  const proxyReq = fetchClient.get(fetchUrl, { headers: fetchHeaders }, (proxyRes) => {
     if (MEDIAFLOW_URL) {
-      console.log('MediaFlow response:', proxyRes.statusCode, targetUrl.substring(0, 80));
+      console.log('MediaFlow response:', proxyRes.statusCode, 'ct:', proxyRes.headers['content-type'] || 'none', targetUrl.substring(0, 100));
     }
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Headers', '*');
@@ -866,6 +867,7 @@ app.get('/proxy', (req, res) => {
       proxyRes.setEncoding('utf8');
       proxyRes.on('data', (chunk) => { body += chunk; });
       proxyRes.on('end', () => {
+        console.log('Playlist body length:', body.length, 'first 200 chars:', JSON.stringify(body.substring(0, 200)));
         // If the response isn't actually a playlist, send it as-is
         if (!body.trim().startsWith('#EXTM3U')) {
           console.warn('Proxy: URL looked like m3u8 but response is not a playlist, forwarding raw');
@@ -895,11 +897,13 @@ app.get('/proxy', (req, res) => {
         rewritten = rewritten.replace(/URI="([^"]+)"/g, (match, uri) => {
           return 'URI="' + proxyLine(uri) + '"';
         });
+        console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
       });
     } else {
       // Stream binary data (video segments, keys, etc.)
+      console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
       // Forward status code (206 for partial content / range requests)
       res.status(proxyRes.statusCode);
       if (proxyRes.headers['content-type']) {
