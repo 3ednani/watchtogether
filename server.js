@@ -821,7 +821,74 @@ app.get('/proxy', (req, res) => {
     proxyHeaders['Range'] = req.headers.range;
   }
 
-  // Route through MediaFlow Proxy if configured (avoids datacenter IP blocking)
+  // Helper: rewrite m3u8 playlist body so all URLs route through our proxy
+  const isPlaylistUrl = targetUrl.includes('.m3u8');
+  const rewritePlaylist = (body) => {
+    const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+    const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+    const origin = new URL(targetUrl).origin;
+    const proxyLine = (url) => {
+      let absolute;
+      if (url.startsWith('http')) absolute = url;
+      else if (url.startsWith('/')) absolute = origin + url;
+      else absolute = baseUrl + url;
+      return '/proxy?url=' + encodeURIComponent(absolute) + refParam;
+    };
+    let rewritten = body.replace(/^(?!#)(.+)$/gm, (match, line) => {
+      line = line.trim();
+      if (!line) return match;
+      return proxyLine(line);
+    });
+    rewritten = rewritten.replace(/URI="([^"]+)"/g, (match, uri) => {
+      return 'URI="' + proxyLine(uri) + '"';
+    });
+    return rewritten;
+  };
+
+  // For m3u8 playlists via MediaFlow: use fetch() to avoid streaming proxy hanging
+  if (MEDIAFLOW_URL && isPlaylistUrl) {
+    const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/stream');
+    mfUrl.searchParams.set('d', targetUrl);
+    if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+    console.log('Fetching playlist via MediaFlow:', targetUrl.substring(0, 100));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    fetch(mfUrl.href, {
+      headers: { 'Accept-Encoding': 'identity' },
+      signal: controller.signal,
+    })
+      .then(r => {
+        clearTimeout(timeout);
+        console.log('MediaFlow playlist response:', r.status);
+        if (!r.ok) throw new Error('MediaFlow returned ' + r.status);
+        return r.text();
+      })
+      .then(body => {
+        console.log('Playlist body length:', body.length, 'first 200 chars:', JSON.stringify(body.substring(0, 200)));
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Headers', '*');
+        if (!body.trim().startsWith('#EXTM3U')) {
+          console.warn('Proxy: response is not a valid playlist, forwarding raw');
+          res.set('Content-Type', 'application/vnd.apple.mpegurl');
+          res.send(body);
+          return;
+        }
+        const rewritten = rewritePlaylist(body);
+        console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+      })
+      .catch(err => {
+        clearTimeout(timeout);
+        console.error('MediaFlow playlist fetch error:', err.message);
+        if (!res.headersSent) res.status(502).send('Playlist fetch failed');
+      });
+    return;
+  }
+
+  // Route through MediaFlow Proxy if configured (for non-playlist requests)
   let fetchUrl = targetUrl;
   let fetchClient = client;
   if (MEDIAFLOW_URL) {
@@ -830,7 +897,7 @@ app.get('/proxy', (req, res) => {
     if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
     fetchUrl = mfUrl.href;
     fetchClient = mfUrl.protocol === 'https:' ? https : http;
-    console.log('Proxy via MediaFlow:', targetUrl.substring(0, 80));
+    console.log('Proxy via MediaFlow:', targetUrl.substring(0, 100));
   }
 
   const fetchHeaders = MEDIAFLOW_URL ? { 'Accept-Encoding': 'identity' } : proxyHeaders;
@@ -864,59 +931,20 @@ app.get('/proxy', (req, res) => {
 
     if (isPlaylist) {
       let body = '';
-      let processed = false;
       proxyRes.setEncoding('utf8');
-
-      const processPlaylist = () => {
-        if (processed) return;
-        processed = true;
-        proxyRes.destroy(); // close the upstream connection
-        console.log('Playlist body length:', body.length, 'first 200 chars:', JSON.stringify(body.substring(0, 200)));
+      proxyRes.on('data', (chunk) => { body += chunk; });
+      proxyRes.on('end', () => {
+        console.log('Playlist body length:', body.length);
         if (res.headersSent) return;
-        // If the response isn't actually a playlist, send it as-is
         if (!body.trim().startsWith('#EXTM3U')) {
-          console.warn('Proxy: URL looked like m3u8 but response is not a playlist, forwarding raw');
-          if (proxyRes.headers['content-type']) {
-            res.set('Content-Type', proxyRes.headers['content-type']);
-          }
+          if (proxyRes.headers['content-type']) res.set('Content-Type', proxyRes.headers['content-type']);
           res.send(body);
           return;
         }
-        // Resolve relative URLs in the playlist to absolute, then proxy them
-        const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-        const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
-        const origin = new URL(targetUrl).origin;
-        const proxyLine = (url) => {
-          let absolute;
-          if (url.startsWith('http')) absolute = url;
-          else if (url.startsWith('/')) absolute = origin + url;
-          else absolute = baseUrl + url;
-          return '/proxy?url=' + encodeURIComponent(absolute) + refParam;
-        };
-        let rewritten = body.replace(/^(?!#)(.+)$/gm, (match, line) => {
-          line = line.trim();
-          if (!line) return match;
-          return proxyLine(line);
-        });
-        // Also rewrite URI="..." attributes in #EXT-X-MEDIA and similar tags
-        rewritten = rewritten.replace(/URI="([^"]+)"/g, (match, uri) => {
-          return 'URI="' + proxyLine(uri) + '"';
-        });
-        console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
+        const rewritten = rewritePlaylist(body);
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
-      };
-
-      // MediaFlow's /proxy/stream keeps connections open (streaming proxy),
-      // so 'end' may never fire. Use a data timeout: once data stops arriving
-      // for 2s, process whatever we have.
-      let dataTimer = null;
-      proxyRes.on('data', (chunk) => {
-        body += chunk;
-        if (dataTimer) clearTimeout(dataTimer);
-        dataTimer = setTimeout(processPlaylist, 2000);
       });
-      proxyRes.on('end', processPlaylist);
     } else {
       // Stream binary data (video segments, keys, etc.)
       console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
