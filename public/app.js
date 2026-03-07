@@ -908,12 +908,12 @@ function loadVideo(url, broadcast) {
         enableCEA708Captions: true,
         renderTextTracksNatively: true
       };
-      // For local remux streams, be patient — server generates segments on-demand
-      // and may restart FFmpeg when seeking to an ungenerated position
-      if (isLocalRemux) {
-        hlsConfig.manifestLoadingTimeOut = 15000;
+      // Extend timeouts for proxied/remux streams — the proxy chain
+      // (Render -> MediaFlow -> CDN) needs more time than direct loading
+      if (isLocalRemux || alreadyProxied) {
+        hlsConfig.manifestLoadingTimeOut = 30000;
         hlsConfig.manifestLoadingMaxRetry = 6;
-        hlsConfig.levelLoadingTimeOut = 15000;
+        hlsConfig.levelLoadingTimeOut = 30000;
         hlsConfig.levelLoadingMaxRetry = 6;
         hlsConfig.fragLoadingTimeOut = 45000;
         hlsConfig.fragLoadingMaxRetry = 8;
