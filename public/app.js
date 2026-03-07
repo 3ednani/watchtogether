@@ -906,19 +906,15 @@ function loadVideo(url, broadcast) {
       var hlsConfig = {
         enableWebVTT: true,
         enableCEA708Captions: true,
-        renderTextTracksNatively: true
+        renderTextTracksNatively: true,
+        manifestLoadingTimeOut: 30000,
+        manifestLoadingMaxRetry: 6,
+        levelLoadingTimeOut: 30000,
+        levelLoadingMaxRetry: 6,
+        fragLoadingTimeOut: 45000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingMaxRetryTimeout: 15000
       };
-      // Extend timeouts for proxied/remux streams — the proxy chain
-      // (Render -> MediaFlow -> CDN) needs more time than direct loading
-      if (isLocalRemux || alreadyProxied) {
-        hlsConfig.manifestLoadingTimeOut = 30000;
-        hlsConfig.manifestLoadingMaxRetry = 6;
-        hlsConfig.levelLoadingTimeOut = 30000;
-        hlsConfig.levelLoadingMaxRetry = 6;
-        hlsConfig.fragLoadingTimeOut = 45000;
-        hlsConfig.fragLoadingMaxRetry = 8;
-        hlsConfig.fragLoadingMaxRetryTimeout = 15000;
-      }
       hls = new Hls(hlsConfig);
       hls.loadSource(url);
       hls.attachMedia(video);
