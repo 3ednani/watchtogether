@@ -85,6 +85,13 @@ if (ffmpegAvailable) {
   }
 }
 
+// --- MediaFlow Proxy integration ---
+const MEDIAFLOW_URL = (process.env.MEDIAFLOW_URL || '').replace(/\/+$/, '');
+const MEDIAFLOW_API_PASSWORD = process.env.MEDIAFLOW_API_PASSWORD || '';
+if (MEDIAFLOW_URL) {
+  console.log('MediaFlow Proxy configured:', MEDIAFLOW_URL);
+}
+
 // --- Remux session management ---
 const remuxSessions = new Map();
 const REMUX_DIR = path.join(os.tmpdir(), 'watch-together-remux');
@@ -814,7 +821,18 @@ app.get('/proxy', (req, res) => {
     proxyHeaders['Range'] = req.headers.range;
   }
 
-  const proxyReq = client.get(targetUrl, { headers: proxyHeaders }, (proxyRes) => {
+  // Route through MediaFlow Proxy if configured (avoids datacenter IP blocking)
+  let fetchUrl = targetUrl;
+  let fetchClient = client;
+  if (MEDIAFLOW_URL) {
+    const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/stream');
+    mfUrl.searchParams.set('d', targetUrl);
+    if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+    fetchUrl = mfUrl.href;
+    fetchClient = mfUrl.protocol === 'https:' ? https : http;
+  }
+
+  const proxyReq = fetchClient.get(fetchUrl, { headers: MEDIAFLOW_URL ? {} : proxyHeaders }, (proxyRes) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Headers', '*');
 
