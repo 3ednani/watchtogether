@@ -830,9 +830,13 @@ app.get('/proxy', (req, res) => {
     if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
     fetchUrl = mfUrl.href;
     fetchClient = mfUrl.protocol === 'https:' ? https : http;
+    console.log('Proxy via MediaFlow:', targetUrl.substring(0, 80));
   }
 
   const proxyReq = fetchClient.get(fetchUrl, { headers: MEDIAFLOW_URL ? {} : proxyHeaders }, (proxyRes) => {
+    if (MEDIAFLOW_URL) {
+      console.log('MediaFlow response:', proxyRes.statusCode, targetUrl.substring(0, 80));
+    }
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Headers', '*');
 
@@ -919,8 +923,9 @@ app.get('/proxy', (req, res) => {
     if (!res.headersSent) res.status(502).send('Proxy error');
   });
 
-  proxyReq.setTimeout(15000, () => {
+  proxyReq.setTimeout(MEDIAFLOW_URL ? 30000 : 15000, () => {
     proxyReq.destroy();
+    console.error('Proxy timeout:', targetUrl.substring(0, 80));
     if (!res.headersSent) res.status(504).send('Proxy timeout');
   });
 
