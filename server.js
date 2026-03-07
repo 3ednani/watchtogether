@@ -845,33 +845,40 @@ app.get('/proxy', (req, res) => {
     return rewritten;
   };
 
-  // For m3u8 playlists via MediaFlow: use fetch() to avoid streaming proxy hanging
-  if (MEDIAFLOW_URL && isPlaylistUrl) {
-    const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/stream');
-    mfUrl.searchParams.set('d', targetUrl);
-    if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
-    console.log('Fetching playlist via MediaFlow:', targetUrl.substring(0, 100));
+  // For m3u8 playlists: fetch directly from CDN (skip MediaFlow).
+  // MediaFlow's /proxy/stream never completes the response for small text files.
+  // CDNs serve manifests fine even from datacenter IPs; they only block segments.
+  if (isPlaylistUrl) {
+    console.log('Fetching playlist directly:', targetUrl.substring(0, 100));
+    const playlistClient = parsed.protocol === 'https:' ? https : http;
+    const playlistReq = playlistClient.get(targetUrl, { headers: proxyHeaders }, (proxyRes) => {
+      console.log('Playlist response:', proxyRes.statusCode, 'ct:', proxyRes.headers['content-type'] || 'none');
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+      // Follow redirects
+      if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+        const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
+        proxyRes.resume();
+        const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+        res.redirect('/proxy?url=' + encodeURIComponent(redirectUrl) + refParam);
+        return;
+      }
 
-    fetch(mfUrl.href, {
-      headers: { 'Accept-Encoding': 'identity' },
-      signal: controller.signal,
-    })
-      .then(r => {
-        clearTimeout(timeout);
-        console.log('MediaFlow playlist response:', r.status);
-        if (!r.ok) throw new Error('MediaFlow returned ' + r.status);
-        return r.text();
-      })
-      .then(body => {
+      if (proxyRes.statusCode >= 400) {
+        console.error('Playlist upstream error:', proxyRes.statusCode);
+        proxyRes.resume();
+        if (!res.headersSent) res.status(proxyRes.statusCode).send('Playlist fetch failed');
+        return;
+      }
+
+      let body = '';
+      proxyRes.setEncoding('utf8');
+      proxyRes.on('data', (chunk) => { body += chunk; });
+      proxyRes.on('end', () => {
         console.log('Playlist body length:', body.length, 'first 200 chars:', JSON.stringify(body.substring(0, 200)));
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Access-Control-Allow-Headers', '*');
         if (!body.trim().startsWith('#EXTM3U')) {
-          console.warn('Proxy: response is not a valid playlist, forwarding raw');
-          res.set('Content-Type', 'application/vnd.apple.mpegurl');
+          if (proxyRes.headers['content-type']) res.set('Content-Type', proxyRes.headers['content-type']);
           res.send(body);
           return;
         }
@@ -879,12 +886,16 @@ app.get('/proxy', (req, res) => {
         console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
-      })
-      .catch(err => {
-        clearTimeout(timeout);
-        console.error('MediaFlow playlist fetch error:', err.message);
-        if (!res.headersSent) res.status(502).send('Playlist fetch failed');
       });
+    });
+    playlistReq.on('error', (err) => {
+      console.error('Playlist fetch error:', err.message);
+      if (!res.headersSent) res.status(502).send('Playlist fetch failed');
+    });
+    playlistReq.setTimeout(15000, () => {
+      playlistReq.destroy();
+      if (!res.headersSent) res.status(504).send('Playlist fetch timeout');
+    });
     return;
   }
 
