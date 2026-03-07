@@ -864,10 +864,15 @@ app.get('/proxy', (req, res) => {
 
     if (isPlaylist) {
       let body = '';
+      let processed = false;
       proxyRes.setEncoding('utf8');
-      proxyRes.on('data', (chunk) => { body += chunk; });
-      proxyRes.on('end', () => {
+
+      const processPlaylist = () => {
+        if (processed) return;
+        processed = true;
+        proxyRes.destroy(); // close the upstream connection
         console.log('Playlist body length:', body.length, 'first 200 chars:', JSON.stringify(body.substring(0, 200)));
+        if (res.headersSent) return;
         // If the response isn't actually a playlist, send it as-is
         if (!body.trim().startsWith('#EXTM3U')) {
           console.warn('Proxy: URL looked like m3u8 but response is not a playlist, forwarding raw');
@@ -900,7 +905,18 @@ app.get('/proxy', (req, res) => {
         console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
+      };
+
+      // MediaFlow's /proxy/stream keeps connections open (streaming proxy),
+      // so 'end' may never fire. Use a data timeout: once data stops arriving
+      // for 2s, process whatever we have.
+      let dataTimer = null;
+      proxyRes.on('data', (chunk) => {
+        body += chunk;
+        if (dataTimer) clearTimeout(dataTimer);
+        dataTimer = setTimeout(processPlaylist, 2000);
       });
+      proxyRes.on('end', processPlaylist);
     } else {
       // Stream binary data (video segments, keys, etc.)
       console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
