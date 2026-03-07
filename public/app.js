@@ -788,37 +788,32 @@ function startRemuxSession(url, referer) {
     .then(function(data) {
       if (data.error) {
         console.warn('Remux error:', data.error);
-        // Fallback to proxy
-        var proxyUrl = '/proxy?url=' + encodeURIComponent(url);
-        if (referer) proxyUrl += '&referer=' + encodeURIComponent(referer);
-        loadVideo(proxyUrl, true);
+        // Fallback: try direct URL first (uses client's IP, avoids datacenter blocking),
+        // HLS.js will fall back to proxy automatically if CORS fails
+        loadVideo(url, true);
         return;
       }
       currentRemuxSessionId = data.sessionId;
       if (data.ready) {
         loadRemuxedVideo(data.sessionId);
       } else {
-        pollRemuxReady(data.sessionId, url, referer);
+        pollRemuxReady(data.sessionId, url);
       }
     })
     .catch(function(err) {
       console.warn('Remux request failed:', err);
-      var proxyUrl = '/proxy?url=' + encodeURIComponent(url);
-      if (referer) proxyUrl += '&referer=' + encodeURIComponent(referer);
-      loadVideo(proxyUrl, true);
+      loadVideo(url, true);
     });
 }
 
-function pollRemuxReady(sessionId, url, referer) {
+function pollRemuxReady(sessionId, url) {
   var attempts = 0;
   var pollTimer = setInterval(function() {
     attempts++;
     if (attempts > 120) { // 60 seconds
       clearInterval(pollTimer);
-      syncStatus.textContent = 'Remux timeout, using proxy...';
-      var proxyUrl = '/proxy?url=' + encodeURIComponent(url);
-      if (referer) proxyUrl += '&referer=' + encodeURIComponent(referer);
-      loadVideo(proxyUrl, true);
+      syncStatus.textContent = 'Remux timeout, trying direct...';
+      loadVideo(url, true);
       return;
     }
     fetch('/remux/' + sessionId + '/status')
@@ -829,10 +824,8 @@ function pollRemuxReady(sessionId, url, referer) {
           loadRemuxedVideo(sessionId);
         } else if (data.state === 'error') {
           clearInterval(pollTimer);
-          syncStatus.textContent = 'Remux failed, using proxy...';
-          var proxyUrl = '/proxy?url=' + encodeURIComponent(url);
-          if (referer) proxyUrl += '&referer=' + encodeURIComponent(referer);
-          loadVideo(proxyUrl, true);
+          syncStatus.textContent = 'Remux failed, trying direct...';
+          loadVideo(url, true);
         } else {
           syncStatus.textContent = 'Preparing stream...';
         }
