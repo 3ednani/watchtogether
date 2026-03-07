@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Watch Together</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Join / Create Room Screen -->
+    <div id="lobby" class="screen">
+      <h1>Watch Together</h1>
+      <p class="subtitle">Sync videos in real-time</p>
+      <div id="mode-selector">
+        <div class="mode-options">
+          <button class="mode-btn active" data-mode="both"><i data-lucide="monitor"></i><span>Both</span></button>
+          <button class="mode-btn" data-mode="player"><i data-lucide="tv"></i><span>Player</span></button>
+          <button class="mode-btn" data-mode="remote"><i data-lucide="smartphone"></i><span>Remote</span></button>
+        </div>
+        <p class="mode-hint" id="mode-hint">Full player with controls</p>
+      </div>
+      <div class="form-group">
+        <button id="btn-create" class="btn btn-primary btn-large">Create Room</button>
+        <div class="divider">or join existing</div>
+        <input id="input-room-code" type="text" placeholder="Enter room code" class="input-large" maxlength="6">
+        <button id="btn-join" class="btn btn-secondary btn-large">Join Room</button>
+      </div>
+    </div>
+
+    <!-- Room Screen -->
+    <div id="room" class="screen hidden">
+      <div id="room-header">
+        <div class="room-info">
+          <span id="room-code-display" class="room-code"></span>
+          <button id="btn-copy-link" class="btn btn-small btn-icon-text" title="Copy link"><i data-lucide="copy"></i><span>Copy</span></button>
+        </div>
+        <div class="header-right">
+          <div id="user-count">0 connected</div>
+          <button id="btn-settings" class="btn btn-small btn-icon" title="Settings"><i data-lucide="settings"></i></button>
+        </div>
+      </div>
+
+      <!-- Settings Panel -->
+      <div id="settings-overlay" class="hidden">
+        <div id="settings-panel">
+          <div class="settings-header">
+            <h3>Settings</h3>
+            <button id="btn-close-settings" class="btn btn-small btn-icon" title="Close"><i data-lucide="x"></i></button>
+          </div>
+          <div class="settings-body">
+            <label>Stream Addons</label>
+            <p class="settings-hint">Add Stremio addon URLs that provide streams. Configure your addon (e.g. on <a href="https://torrentio.strem.fun/configure" target="_blank" rel="noopener">torrentio.strem.fun</a>), then paste the full URL here.</p>
+            <p class="settings-hint">Paste the URL up to (but not including) <code>/manifest.json</code>.</p>
+            <div id="addon-list"></div>
+            <div class="addon-add-row">
+              <input id="input-addon-url" type="text" placeholder="e.g. https://torrentio.strem.fun/providers=yts...">
+              <button id="btn-add-addon" class="btn btn-primary btn-small">Add</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Search Bar -->
+      <div id="search-bar">
+        <div class="search-input-wrapper">
+          <i data-lucide="search" class="search-icon"></i>
+          <input id="input-search" type="text" placeholder="Search movies & series..." class="input-large input-with-icon">
+        </div>
+        <button id="btn-search" class="btn btn-primary btn-icon" title="Search"><i data-lucide="search"></i></button>
+      </div>
+
+      <!-- Search Results Grid -->
+      <div id="search-results" class="hidden"></div>
+
+      <!-- Content Detail View -->
+      <div id="content-detail" class="hidden">
+        <button id="btn-back" class="btn btn-secondary btn-small btn-icon-text"><i data-lucide="chevron-left"></i><span>Back</span></button>
+        <div id="detail-inner">
+          <img id="detail-poster" src="" alt="">
+          <div id="detail-info">
+            <h2 id="detail-title"></h2>
+            <span id="detail-year" class="detail-badge"></span>
+            <span id="detail-type-badge" class="detail-badge"></span>
+            <p id="detail-description"></p>
+            <!-- Season/Episode picker (series only) -->
+            <div id="episode-picker" class="hidden">
+              <select id="season-select"></select>
+              <div id="episode-list"></div>
+            </div>
+            <!-- Stream list -->
+            <div id="stream-section" class="hidden">
+              <h3 id="stream-title">Available Streams</h3>
+              <div id="stream-list"></div>
+              <div id="stream-loading" class="hidden">Loading streams...</div>
+              <div id="stream-empty" class="hidden">No streams found. Add a streaming addon in Settings.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Video Player -->
+      <div id="player-container" class="hidden">
+        <video id="video-player" playsinline>
+          Your browser does not support the video tag.
+        </video>
+        <!-- Loading spinner overlay -->
+        <div id="video-spinner" class="hidden">
+          <div class="spinner-ring"></div>
+        </div>
+        <!-- Skip overlay (centered on video) -->
+        <div id="skip-overlay">
+          <button id="btn-skip-back" class="skip-btn"><i data-lucide="skip-back"></i><span class="skip-label">10</span></button>
+          <button id="btn-skip-fwd" class="skip-btn"><i data-lucide="skip-forward"></i><span class="skip-label">10</span></button>
+        </div>
+        <!-- Controls -->
+        <div id="controls">
+          <div id="progress-row">
+            <div id="progress-bar">
+              <div id="progress-fill"></div>
+              <div id="progress-thumb"></div>
+            </div>
+          </div>
+          <div id="controls-row">
+            <div class="controls-left">
+              <button id="btn-play-pause" class="btn-control" title="Play"><i data-lucide="play"></i></button>
+              <button id="btn-skip-back-ctrl" class="btn-control btn-control-small" title="Back 10s"><i data-lucide="skip-back"></i></button>
+              <button id="btn-skip-fwd-ctrl" class="btn-control btn-control-small" title="Forward 10s"><i data-lucide="skip-forward"></i></button>
+              <span id="time-display">0:00 / 0:00</span>
+            </div>
+            <div class="controls-right">
+              <button id="btn-audio" class="btn-control hidden" title="Audio"><i data-lucide="volume-2"></i></button>
+              <button id="btn-subs" class="btn-control" title="Subtitles"><i data-lucide="captions"></i></button>
+              <button id="btn-fullscreen" class="btn-control" title="Fullscreen"><i data-lucide="maximize"></i></button>
+            </div>
+          </div>
+        </div>
+        <!-- Subtitle selector dropdown -->
+        <div id="sub-menu" class="hidden">
+          <div id="sub-menu-title">Subtitles</div>
+          <div id="sub-tracks"></div>
+          <div id="sub-external">
+            <input id="input-sub-url" type="text" placeholder="Subtitle URL (.vtt / .srt)">
+            <button id="btn-load-sub" class="btn btn-small btn-primary">Add URL</button>
+            <button id="btn-sub-file" class="btn btn-small btn-secondary">Browse File</button>
+            <input id="input-sub-file" type="file" accept=".vtt,.srt,.ass,.ssa" style="display:none">
+          </div>
+        </div>
+        <!-- Audio track selector dropdown -->
+        <div id="audio-menu" class="hidden">
+          <div id="audio-menu-title">Audio</div>
+          <div id="audio-tracks"></div>
+        </div>
+      </div>
+
+      <!-- Remote Control (no video, just controls) -->
+      <div id="remote-container" class="hidden">
+        <div id="remote-now-playing">
+          <span id="remote-title">No video loaded</span>
+        </div>
+        <div id="remote-progress-wrapper">
+          <div id="remote-progress-bar">
+            <div id="remote-progress-fill"></div>
+            <div id="remote-progress-thumb"></div>
+          </div>
+        </div>
+        <div id="remote-time-display">0:00 / 0:00</div>
+        <div id="remote-main-controls">
+          <button id="remote-skip-back" class="remote-side-btn" title="Back 10s"><i data-lucide="skip-back"></i></button>
+          <button id="remote-play-pause" class="remote-play-btn" title="Play"><i data-lucide="play"></i></button>
+          <button id="remote-skip-fwd" class="remote-side-btn" title="Forward 10s"><i data-lucide="skip-forward"></i></button>
+        </div>
+        <!-- Remote track controls -->
+        <div id="remote-track-controls" class="hidden">
+          <button id="remote-btn-audio" class="remote-track-btn hidden" title="Audio"><i data-lucide="volume-2"></i></button>
+          <button id="remote-btn-subs" class="remote-track-btn" title="Subtitles"><i data-lucide="captions"></i></button>
+        </div>
+        <!-- Remote Audio menu -->
+        <div id="remote-audio-menu" class="hidden">
+          <div class="remote-menu-title">Audio</div>
+          <div id="remote-audio-tracks"></div>
+        </div>
+        <!-- Remote Subtitle menu -->
+        <div id="remote-sub-menu" class="hidden">
+          <div class="remote-menu-title">Subtitles</div>
+          <div id="remote-sub-tracks"></div>
+          <div id="remote-sub-external">
+            <input id="remote-input-sub-url" type="text" placeholder="Subtitle URL (.vtt / .srt)">
+            <button id="remote-btn-load-sub" class="btn btn-small btn-primary">Add URL</button>
+            <button id="remote-btn-sub-file" class="btn btn-small btn-secondary">Browse File</button>
+            <input id="remote-input-sub-file" type="file" accept=".vtt,.srt,.ass,.ssa" style="display:none">
+          </div>
+        </div>
+      </div>
+
+      <div id="status-bar">
+        <span id="sync-status">Waiting for video...</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
