@@ -834,8 +834,6 @@ app.get('/proxy', (req, res) => {
       if (url.startsWith('http')) absolute = url;
       else if (url.startsWith('/')) absolute = origin + url;
       else absolute = baseUrl + url;
-      // Segments (media playlist): direct CDN URL; sub-playlists (master): through proxy
-      if (!isMasterPl) return absolute;
       return '/proxy?url=' + encodeURIComponent(absolute) + refParam + plHint;
     };
     let rewritten = body.replace(/^(?!#)(.+)$/gm, (match, line) => {
@@ -906,11 +904,25 @@ app.get('/proxy', (req, res) => {
         const isMaster = body.includes('#EXT-X-STREAM-INF') || body.includes('#EXT-X-MEDIA');
         const playlistHint = isMaster ? '&playlist=1' : '';
 
+        // For master playlists, filter out 1080p to avoid socket hang ups on MediaFlow
+        if (isMaster) {
+          const lines = body.split('\n');
+          const filtered = [];
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes('RESOLUTION=') && /1920x|1080/.test(lines[i])) {
+              i++; // skip the URL line after #EXT-X-STREAM-INF
+              continue;
+            }
+            // Also filter 1080p from #EXT-X-MEDIA renditions
+            if (lines[i].includes('rendition=1080p')) continue;
+            filtered.push(lines[i]);
+          }
+          body = filtered.join('\n');
+        }
+
         let rewritten;
         if (MEDIAFLOW_URL) {
-          // MediaFlow rewrites URLs to point through itself. We need to re-rewrite them.
-          // Master playlists: sub-playlist URLs go through our proxy (need rewriting).
-          // Media playlists: segment URLs go direct to CDN (browser fetches in 1 hop).
+          // MediaFlow rewrites URLs to point through itself. Re-rewrite through our proxy.
           const mfOrigin = new URL(MEDIAFLOW_URL).origin;
           const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
@@ -919,11 +931,7 @@ app.get('/proxy', (req, res) => {
               const u = new URL(mfLink);
               const originalUrl = u.searchParams.get('d');
               if (originalUrl) {
-                if (isMaster) {
-                  return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
-                }
-                // Segments: let browser fetch directly from CDN
-                return originalUrl;
+                return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
               }
             } catch (e) {}
             return mfLink;
@@ -1031,8 +1039,7 @@ app.get('/proxy', (req, res) => {
                 const u = new URL(mfLink);
                 const originalUrl = u.searchParams.get('d');
                 if (originalUrl) {
-                  if (isMaster2) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
-                  return originalUrl;
+                  return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
                 }
               } catch (e) {}
               return mfLink;
