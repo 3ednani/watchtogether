@@ -845,18 +845,33 @@ app.get('/proxy', (req, res) => {
     return rewritten;
   };
 
-  // For m3u8 playlists: fetch directly from CDN (skip MediaFlow).
-  // MediaFlow's /proxy/stream never completes the response for small text files.
-  // CDNs serve manifests fine even from datacenter IPs; they only block segments.
+  // For m3u8 playlists via MediaFlow: use the dedicated HLS manifest endpoint
+  // (/proxy/hls/manifest.m3u8) instead of /proxy/stream which never completes for text.
+  // Without MediaFlow: fetch directly from CDN.
   if (isPlaylistUrl) {
-    console.log('Fetching playlist directly:', targetUrl.substring(0, 100));
-    const playlistClient = parsed.protocol === 'https:' ? https : http;
-    const playlistReq = playlistClient.get(targetUrl, { headers: proxyHeaders }, (proxyRes) => {
+    let playlistFetchUrl, playlistFetchClient, playlistFetchHeaders;
+
+    if (MEDIAFLOW_URL) {
+      const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/hls/manifest.m3u8');
+      mfUrl.searchParams.set('d', targetUrl);
+      if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+      playlistFetchUrl = mfUrl.href;
+      playlistFetchClient = mfUrl.protocol === 'https:' ? https : http;
+      playlistFetchHeaders = { 'Accept-Encoding': 'identity' };
+      console.log('Fetching playlist via MediaFlow HLS endpoint:', targetUrl.substring(0, 100));
+    } else {
+      playlistFetchUrl = targetUrl;
+      playlistFetchClient = parsed.protocol === 'https:' ? https : http;
+      playlistFetchHeaders = proxyHeaders;
+      console.log('Fetching playlist directly:', targetUrl.substring(0, 100));
+    }
+
+    const playlistReq = playlistFetchClient.get(playlistFetchUrl, { headers: playlistFetchHeaders }, (proxyRes) => {
       console.log('Playlist response:', proxyRes.statusCode, 'ct:', proxyRes.headers['content-type'] || 'none');
 
       // Follow redirects
       if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-        const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
+        const redirectUrl = new URL(proxyRes.headers.location, playlistFetchUrl).href;
         proxyRes.resume();
         const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
         res.redirect('/proxy?url=' + encodeURIComponent(redirectUrl) + refParam);
@@ -882,10 +897,34 @@ app.get('/proxy', (req, res) => {
           res.send(body);
           return;
         }
-        const rewritten = rewritePlaylist(body);
+
+        let rewritten;
+        if (MEDIAFLOW_URL) {
+          // MediaFlow rewrites URLs to point through itself. We need to re-rewrite
+          // them to go through our proxy with the original CDN URLs.
+          const mfOrigin = new URL(MEDIAFLOW_URL).origin;
+          const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+          rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
+            try {
+              const u = new URL(mfLink);
+              const originalUrl = u.searchParams.get('d');
+              if (originalUrl) {
+                return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
+              }
+            } catch (e) {}
+            return mfLink;
+          });
+        } else {
+          rewritten = rewritePlaylist(body);
+        }
         console.log('Rewritten playlist first 300 chars:', JSON.stringify(rewritten.substring(0, 300)));
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewritten);
+      });
+      proxyRes.on('error', (err) => {
+        console.error('Playlist response error:', err.message);
+        if (!res.headersSent) res.status(502).send('Playlist read error');
       });
     });
     playlistReq.on('error', (err) => {
