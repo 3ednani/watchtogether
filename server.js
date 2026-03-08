@@ -822,17 +822,19 @@ app.get('/proxy', (req, res) => {
   }
 
   // Helper: rewrite m3u8 playlist body so all URLs route through our proxy
-  const isPlaylistUrl = targetUrl.includes('.m3u8');
+  const isPlaylistUrl = targetUrl.includes('.m3u8') || req.query.playlist === '1';
   const rewritePlaylist = (body) => {
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+    const isMasterPl = body.includes('#EXT-X-STREAM-INF') || body.includes('#EXT-X-MEDIA');
+    const plHint = isMasterPl ? '&playlist=1' : '';
     const origin = new URL(targetUrl).origin;
     const proxyLine = (url) => {
       let absolute;
       if (url.startsWith('http')) absolute = url;
       else if (url.startsWith('/')) absolute = origin + url;
       else absolute = baseUrl + url;
-      return '/proxy?url=' + encodeURIComponent(absolute) + refParam;
+      return '/proxy?url=' + encodeURIComponent(absolute) + refParam + plHint;
     };
     let rewritten = body.replace(/^(?!#)(.+)$/gm, (match, line) => {
       line = line.trim();
@@ -898,6 +900,10 @@ app.get('/proxy', (req, res) => {
           return;
         }
 
+        // Master playlists reference sub-playlists; media playlists reference segments
+        const isMaster = body.includes('#EXT-X-STREAM-INF') || body.includes('#EXT-X-MEDIA');
+        const playlistHint = isMaster ? '&playlist=1' : '';
+
         let rewritten;
         if (MEDIAFLOW_URL) {
           // MediaFlow rewrites URLs to point through itself. We need to re-rewrite
@@ -910,7 +916,7 @@ app.get('/proxy', (req, res) => {
               const u = new URL(mfLink);
               const originalUrl = u.searchParams.get('d');
               if (originalUrl) {
-                return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
+                return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
               }
             } catch (e) {}
             return mfLink;
@@ -1008,6 +1014,8 @@ app.get('/proxy', (req, res) => {
               res.send(body);
               return;
             }
+            const isMaster2 = body.includes('#EXT-X-STREAM-INF') || body.includes('#EXT-X-MEDIA');
+            const playlistHint2 = isMaster2 ? '&playlist=1' : '';
             const mfOrigin = new URL(MEDIAFLOW_URL).origin;
             const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
@@ -1015,7 +1023,7 @@ app.get('/proxy', (req, res) => {
               try {
                 const u = new URL(mfLink);
                 const originalUrl = u.searchParams.get('d');
-                if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
+                if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
               } catch (e) {}
               return mfLink;
             });
