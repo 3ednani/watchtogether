@@ -615,6 +615,7 @@ function fetchStreams(type, id) {
 
   var pending = addons.length;
   var allStreams = [];
+  lastFetchedStreams = [];
 
   addons.forEach(function(addon) {
     var url = '/api/streams/' + encodeURIComponent(type) + '/' + encodeURIComponent(id) +
@@ -637,6 +638,7 @@ function fetchStreams(type, id) {
             streamEmpty.style.display = 'block';
             return;
           }
+          lastFetchedStreams = allStreams;
           renderStreams(allStreams);
         }
       });
@@ -732,11 +734,20 @@ function selectStream(stream) {
 }
 
 // --- Transcode state ---
+var lastFetchedStreams = []; // all streams from last fetchStreams call
 var currentTranscode = null; // { url, referer, duration, meta, audioTrack }
 var currentAudioTrack = 0;
 var transcodeDisplayTimer = null;
 var transcodeWallStart = 0; // Date.now() when stream started playing
 var transcodeTimeOffset = 0; // absolute start time of current stream
+var subtitleOverlay = document.getElementById('subtitle-overlay');
+if (!subtitleOverlay) {
+  subtitleOverlay = document.createElement('div');
+  subtitleOverlay.id = 'subtitle-overlay';
+  var pc = document.getElementById('player-container');
+  if (pc) pc.insertBefore(subtitleOverlay, pc.querySelector('#video-spinner') || pc.firstChild.nextSibling);
+}
+var activeSubTrack = -1; // textTracks index, -1 = off
 
 function startTranscodeDisplayLoop() {
   stopTranscodeDisplayLoop();
@@ -761,6 +772,8 @@ function startTranscodeDisplayLoop() {
     } else {
       timeDisplay.textContent = formatTime(time) + ' / --:--';
     }
+    // Update custom subtitle overlay
+    updateSubtitleOverlay(time);
   }, 250);
 }
 
@@ -769,6 +782,7 @@ function stopTranscodeDisplayLoop() {
     clearInterval(transcodeDisplayTimer);
     transcodeDisplayTimer = null;
   }
+  if (subtitleOverlay) subtitleOverlay.innerHTML = '';
 }
 
 function getRealTime() {
@@ -788,6 +802,91 @@ function getRealTime() {
 function getRealDuration() {
   if (currentTranscode && currentTranscode.duration > 0) return currentTranscode.duration;
   return video.duration;
+}
+
+function parseVttTimestamp(str) {
+  var parts = str.trim().replace(',', '.').split(':');
+  if (parts.length === 3) return parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseFloat(parts[2]);
+  if (parts.length === 2) return parseInt(parts[0])*60 + parseFloat(parts[1]);
+  return parseFloat(str) || 0;
+}
+
+function fetchSubtitleTrack(url, cuesArray) {
+  var lastLength = 0;
+  function poll() {
+    fetch(url).then(function(r) { return r.text(); }).then(function(vtt) {
+      if (vtt.length > lastLength) {
+        // Re-parse entire VTT (server sends cached data that grows over time)
+        cuesArray.length = 0;
+        var lines = vtt.replace(/\r\n/g, '\n').split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var arrowIdx = lines[i].indexOf('-->');
+          if (arrowIdx === -1) continue;
+          var left = lines[i].substring(0, arrowIdx).trim();
+          var right = lines[i].substring(arrowIdx + 3).trim().split(/\s/)[0];
+          var start = parseVttTimestamp(left);
+          var end = parseVttTimestamp(right);
+          var text = '';
+          for (var k = i + 1; k < lines.length; k++) {
+            if (lines[k].trim() === '' || lines[k].indexOf('-->') !== -1) break;
+            if (text) text += '\n';
+            text += lines[k].trim();
+          }
+          if (text) cuesArray.push({ start: start, end: end, text: text });
+        }
+        lastLength = vtt.length;
+        console.log('Subtitles: loaded ' + cuesArray.length + ' cues (' + vtt.length + ' bytes)');
+      }
+      // Poll again if extraction might still be in progress
+      if (!currentTranscode) return;
+      if (cuesArray.length === 0 || vtt.length < 100 || lastLength !== vtt.length) {
+        setTimeout(poll, 3000);
+      } else {
+        // Check once more after a delay in case more data arrives
+        setTimeout(function() {
+          fetch(url).then(function(r) { return r.text(); }).then(function(vtt2) {
+            if (vtt2.length > lastLength) poll();
+          });
+        }, 5000);
+      }
+    }).catch(function(e) {
+      console.error('Subtitle fetch failed:', e);
+      if (currentTranscode) setTimeout(poll, 5000);
+    });
+  }
+  poll();
+}
+
+
+function updateSubtitleOverlay(time) {
+  if (!subtitleOverlay) return;
+  if (!currentTranscode || activeSubTrack < 0 || !currentTranscode.subtitleCues || !currentTranscode.subtitleCues[activeSubTrack]) {
+    subtitleOverlay.innerHTML = '';
+    return;
+  }
+  var cues = currentTranscode.subtitleCues[activeSubTrack];
+  var html = '';
+  for (var i = 0; i < cues.length; i++) {
+    if (time >= cues[i].start && time <= cues[i].end) {
+      if (html) html += '<br>';
+      html += '<span>' + cues[i].text.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span>';
+    }
+  }
+  subtitleOverlay.innerHTML = html;
+}
+
+function findHlsSubtitleSource() {
+  for (var i = 0; i < lastFetchedStreams.length; i++) {
+    var s = lastFetchedStreams[i];
+    if (s.url && s.url.includes('.m3u8')) {
+      var ref = '';
+      if (s.behaviorHints && s.behaviorHints.proxyHeaders && s.behaviorHints.proxyHeaders.request) {
+        ref = s.behaviorHints.proxyHeaders.request.Referer || '';
+      }
+      return { url: s.url, referer: ref };
+    }
+  }
+  return null;
 }
 
 function startTranscodeSession(url, referer, broadcast) {
@@ -839,7 +938,24 @@ function startTranscodeSession(url, referer, broadcast) {
       }
 
       loadTranscodedStream(url, referer, 0, currentAudioTrack);
+
+      // Always load embedded subtitles first (auto-selects English)
       loadTranscodeSubtitles(url, referer, meta.subtitleTracks || []);
+
+      // Also fetch VidSrc HLS subtitles and append them
+      var hlsSrc = findHlsSubtitleSource();
+      if (hlsSrc) {
+        var hlsMetaUrl = '/transcode/metadata?url=' + encodeURIComponent(hlsSrc.url);
+        if (hlsSrc.referer) hlsMetaUrl += '&referer=' + encodeURIComponent(hlsSrc.referer);
+        fetch(hlsMetaUrl)
+          .then(function(r) { return r.json(); })
+          .then(function(hlsMeta) {
+            if (hlsMeta.subtitleTracks && hlsMeta.subtitleTracks.length > 0) {
+              appendVixsrcSubtitles(hlsSrc.url, hlsSrc.referer, hlsMeta.subtitleTracks);
+            }
+          })
+          .catch(function() {});
+      }
     })
     .catch(function(err) {
       console.warn('Transcode request failed:', err);
@@ -872,6 +988,12 @@ function loadTranscodedStream(url, referer, startTime, audioTrack) {
 function loadTranscodeSubtitles(url, referer, subtitleTracks) {
   if (!subtitleTracks || subtitleTracks.length === 0) return;
   clearSubtitleUI();
+  activeSubTrack = -1;
+  if (subtitleOverlay) subtitleOverlay.innerHTML = '';
+
+  // Cache cues in currentTranscode so they survive seek-restarts
+  currentTranscode.subtitleCues = {};
+
   var engSubBtn = null;
   var engSubIdx = -1;
 
@@ -880,28 +1002,69 @@ function loadTranscodeSubtitles(url, referer, subtitleTracks) {
       + '&track=' + i;
     if (referer) subUrl += '&referer=' + encodeURIComponent(referer);
 
-    var track = document.createElement('track');
-    track.kind = 'subtitles';
-    track.label = sub.title + ' (' + sub.lang + ')';
-    track.srclang = sub.lang;
-    track.src = subUrl;
-    track.setAttribute('data-external', 'true');
-    video.appendChild(track);
+    var label = sub.title + ' (' + sub.lang + ')';
 
-    var idx = video.textTracks.length - 1;
-    addSubtitleButton(track.label, idx);
+    // Start streaming fetch — cues load progressively and persist across seeks
+    currentTranscode.subtitleCues[i] = [];
+    fetchSubtitleTrack(subUrl, currentTranscode.subtitleCues[i]);
+
+    var btn = document.createElement('button');
+    btn.textContent = label;
+    btn.className = 'sub-track-btn';
+    (function(trackIdx) {
+      btn.addEventListener('click', function() {
+        if (activeSubTrack === trackIdx) return;
+        activeSubTrack = trackIdx;
+        if (subtitleOverlay) subtitleOverlay.innerHTML = '';
+        setActiveSubBtn(btn);
+      });
+    })(i);
+    subTracks.appendChild(btn);
+
     if (engSubBtn === null && (isEnglish(sub.lang) || isEnglish(sub.title))) {
-      engSubBtn = subTracks.lastChild;
-      engSubIdx = idx;
+      engSubBtn = btn;
+      engSubIdx = i;
     }
   });
 
   // Auto-select English subtitle
-  if (engSubBtn && engSubIdx !== -1) {
-    disableAllSubs();
-    video.textTracks[engSubIdx].mode = 'showing';
+  if (engSubBtn !== null && engSubIdx !== -1) {
+    activeSubTrack = engSubIdx;
     setActiveSubBtn(engSubBtn);
   }
+  broadcastSubtitleTrackList();
+}
+
+function appendVixsrcSubtitles(hlsUrl, hlsReferer, subtitleTracks) {
+  if (!currentTranscode || !currentTranscode.subtitleCues) return;
+
+  // Track the starting index for vixsrc cues (after embedded tracks)
+  var startIdx = Object.keys(currentTranscode.subtitleCues).length;
+
+  subtitleTracks.forEach(function(sub, i) {
+    var subUrl = '/transcode/subtitles?url=' + encodeURIComponent(hlsUrl)
+      + '&track=' + i;
+    if (hlsReferer) subUrl += '&referer=' + encodeURIComponent(hlsReferer);
+
+    var label = (sub.title || sub.lang || 'Track ' + (i + 1)) + ' (vixsrc)';
+    var cueIdx = startIdx + i;
+    currentTranscode.subtitleCues[cueIdx] = [];
+    fetchSubtitleTrack(subUrl, currentTranscode.subtitleCues[cueIdx]);
+
+    var btn = document.createElement('button');
+    btn.textContent = label;
+    btn.className = 'sub-track-btn';
+    (function(trackIdx) {
+      btn.addEventListener('click', function() {
+        if (activeSubTrack === trackIdx) return;
+        activeSubTrack = trackIdx;
+        if (subtitleOverlay) subtitleOverlay.innerHTML = '';
+        setActiveSubBtn(btn);
+      });
+    })(cueIdx);
+    subTracks.appendChild(btn);
+  });
+
   broadcastSubtitleTrackList();
 }
 
@@ -1449,6 +1612,8 @@ function clearSubtitleUI() {
   offBtn.className = 'sub-track-btn active';
   offBtn.addEventListener('click', function() {
     disableAllSubs();
+    activeSubTrack = -1;
+    if (subtitleOverlay) subtitleOverlay.innerHTML = '';
     setActiveSubBtn(offBtn);
     socket.emit('remove-subtitle');
   });
@@ -1914,15 +2079,22 @@ socket.on('select-subtitle-track', function(data) {
   var index = data.index;
   if (index === -1 || index == null) {
     disableAllSubs();
+    activeSubTrack = -1;
+    if (subtitleOverlay) subtitleOverlay.innerHTML = '';
     clearSubtitleUI();
-    detectHLSSubtitles();
+    if (!currentTranscode) detectHLSSubtitles();
   } else {
     disableAllSubs();
-    if (hls && hls.subtitleTracks && hls.subtitleTracks.length > index) {
-      hls.subtitleTrack = index;
-    }
-    if (video.textTracks[index]) {
-      video.textTracks[index].mode = 'showing';
+    if (currentTranscode) {
+      activeSubTrack = index;
+      if (subtitleOverlay) subtitleOverlay.innerHTML = '';
+    } else {
+      if (hls && hls.subtitleTracks && hls.subtitleTracks.length > index) {
+        hls.subtitleTrack = index;
+      }
+      if (video.textTracks[index]) {
+        video.textTracks[index].mode = 'showing';
+      }
     }
     var btns = subTracks.querySelectorAll('.sub-track-btn');
     for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');

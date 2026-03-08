@@ -200,6 +200,29 @@ input::placeholder { color: #555; }
   max-height: calc(100vh - 220px);
 }
 
+/* --- Custom Subtitle Overlay --- */
+#subtitle-overlay {
+  position: absolute;
+  bottom: 90px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  pointer-events: none;
+  z-index: 3;
+  padding: 0 10%;
+}
+#subtitle-overlay span {
+  display: inline;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 1.35rem;
+  padding: 2px 8px;
+  line-height: 1.6;
+  border-radius: 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
 /* --- Video Loading Spinner --- */
 #video-spinner {
   position: absolute;

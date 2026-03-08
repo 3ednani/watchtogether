@@ -120,6 +120,7 @@ function probeInput(url, referer) {
 
 // Metadata cache for probed streams
 const metadataCache = new Map(); // url -> metadata
+const subtitleCache = new Map(); // "url|track" -> { status: 'extracting'|'done', data: '' }
 
 // Helper: get stream key from URL
 function getStreamKey(url) {
@@ -170,7 +171,60 @@ async function getOrProbeMetadata(url, referer) {
 
   console.log(`[Transcode] Probe: duration=${duration.toFixed(1)}s, video=${videoCodec}${needsTranscode ? '->transcode' : '->copy'}, ${audioStreams.length} audio, ${subtitleStreams.length} subs`);
   metadataCache.set(url, metadata);
+
+  // Pre-extract all subtitle tracks in background so they're cached for seeking
+  if (subtitleStreams.length > 0) {
+    preExtractSubtitles(url, referer, subtitleStreams.length);
+  }
+
   return metadata;
+}
+
+function preExtractSubtitles(url, referer, trackCount) {
+  const headerStr = referer
+    ? `Referer: ${referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
+    : `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`;
+
+  for (let track = 0; track < trackCount; track++) {
+    const cacheKey = `${url}|${track}`;
+    if (subtitleCache.has(cacheKey)) continue;
+
+    subtitleCache.set(cacheKey, { status: 'extracting', data: '' });
+    console.log(`[Subtitles] Pre-extracting track ${track} for ${url.substring(0, 60)}...`);
+
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-headers', headerStr,
+      '-i', url,
+      '-map', `0:s:${track}`,
+      '-c:s', 'webvtt',
+      '-f', 'webvtt',
+      'pipe:1'
+    ];
+
+    const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let vttData = '';
+
+    proc.stdout.on('data', (chunk) => {
+      vttData += chunk.toString();
+      // Update cache progressively so client gets partial data while extracting
+      const entry = subtitleCache.get(cacheKey);
+      if (entry) entry.data = vttData;
+    });
+
+    proc.on('close', (code) => {
+      const entry = subtitleCache.get(cacheKey);
+      if (entry) {
+        entry.status = 'done';
+        entry.data = vttData;
+      }
+      console.log(`[Subtitles] Track ${track} extraction ${code === 0 ? 'complete' : 'failed'} (${vttData.length} bytes)`);
+    });
+
+    proc.on('error', () => {
+      subtitleCache.delete(cacheKey);
+    });
+  }
 }
 
 // Helper: build FFmpeg args for fragmented MP4 streaming
@@ -462,6 +516,18 @@ app.get('/transcode/subtitles', (req, res) => {
   const track = parseInt(req.query.track) || 0;
   if (!url) return res.status(400).send('Missing url parameter');
 
+  const cacheKey = `${url}|${track}`;
+  const cached = subtitleCache.get(cacheKey);
+
+  // Serve from cache — send whatever we have (complete or partial)
+  if (cached && cached.data.length > 0) {
+    res.set('Content-Type', 'text/vtt');
+    res.set('Cache-Control', 'no-cache');
+    res.send(cached.data);
+    return;
+  }
+
+  // Fallback: extract on demand if cache miss
   const headerStr = referer
     ? `Referer: ${referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
     : `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`;
