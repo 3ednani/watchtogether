@@ -230,6 +230,7 @@ function buildTranscodeArgs(url, referer, startTime, audioTrack, metadata) {
 
   // Fragmented MP4 output piped to stdout
   args.push(
+    '-avoid_negative_ts', 'make_zero',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     '-frag_duration', '500000',
     '-f', 'mp4',
