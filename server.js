@@ -834,6 +834,8 @@ app.get('/proxy', (req, res) => {
       if (url.startsWith('http')) absolute = url;
       else if (url.startsWith('/')) absolute = origin + url;
       else absolute = baseUrl + url;
+      // Segments (media playlist): direct CDN URL; sub-playlists (master): through proxy
+      if (!isMasterPl) return absolute;
       return '/proxy?url=' + encodeURIComponent(absolute) + refParam + plHint;
     };
     let rewritten = body.replace(/^(?!#)(.+)$/gm, (match, line) => {
@@ -906,8 +908,9 @@ app.get('/proxy', (req, res) => {
 
         let rewritten;
         if (MEDIAFLOW_URL) {
-          // MediaFlow rewrites URLs to point through itself. We need to re-rewrite
-          // them to go through our proxy with the original CDN URLs.
+          // MediaFlow rewrites URLs to point through itself. We need to re-rewrite them.
+          // Master playlists: sub-playlist URLs go through our proxy (need rewriting).
+          // Media playlists: segment URLs go direct to CDN (browser fetches in 1 hop).
           const mfOrigin = new URL(MEDIAFLOW_URL).origin;
           const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
@@ -916,7 +919,11 @@ app.get('/proxy', (req, res) => {
               const u = new URL(mfLink);
               const originalUrl = u.searchParams.get('d');
               if (originalUrl) {
-                return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
+                if (isMaster) {
+                  return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
+                }
+                // Segments: let browser fetch directly from CDN
+                return originalUrl;
               }
             } catch (e) {}
             return mfLink;
@@ -1023,7 +1030,10 @@ app.get('/proxy', (req, res) => {
               try {
                 const u = new URL(mfLink);
                 const originalUrl = u.searchParams.get('d');
-                if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
+                if (originalUrl) {
+                  if (isMaster2) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
+                  return originalUrl;
+                }
               } catch (e) {}
               return mfLink;
             });
