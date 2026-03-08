@@ -939,123 +939,124 @@ app.get('/proxy', (req, res) => {
   }
 
   // Route through MediaFlow Proxy if configured (for non-playlist requests)
-  let fetchUrl = targetUrl;
-  let fetchClient = client;
-  if (MEDIAFLOW_URL) {
-    const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/stream');
-    mfUrl.searchParams.set('d', targetUrl);
-    if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
-    fetchUrl = mfUrl.href;
-    fetchClient = mfUrl.protocol === 'https:' ? https : http;
-    console.log('Proxy via MediaFlow:', targetUrl.substring(0, 100));
-  }
-
-  const fetchHeaders = MEDIAFLOW_URL ? { 'Accept-Encoding': 'identity' } : proxyHeaders;
-  const proxyReq = fetchClient.get(fetchUrl, { headers: fetchHeaders }, (proxyRes) => {
+  // Includes retry logic for transient errors (socket hang up, etc.)
+  const doProxyRequest = (attempt) => {
+    let fetchUrl = targetUrl;
+    let fetchClient = client;
     if (MEDIAFLOW_URL) {
-      console.log('MediaFlow response:', proxyRes.statusCode, 'ct:', proxyRes.headers['content-type'] || 'none', targetUrl.substring(0, 100));
-    }
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Headers', '*');
-
-    // Follow redirects (3xx)
-    if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-      const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
-      proxyRes.resume();
-      const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
-      res.redirect('/proxy?url=' + encodeURIComponent(redirectUrl) + refParam);
-      return;
+      const mfUrl = new URL(MEDIAFLOW_URL + '/proxy/stream');
+      mfUrl.searchParams.set('d', targetUrl);
+      if (MEDIAFLOW_API_PASSWORD) mfUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+      fetchUrl = mfUrl.href;
+      fetchClient = mfUrl.protocol === 'https:' ? https : http;
+      if (attempt === 1) console.log('Proxy via MediaFlow:', targetUrl.substring(0, 100));
+      else console.log('Proxy via MediaFlow (retry #' + attempt + '):', targetUrl.substring(0, 100));
     }
 
-    // Forward upstream errors
-    if (proxyRes.statusCode >= 400) {
-      console.error('Proxy upstream error:', proxyRes.statusCode, targetUrl.substring(0, 80));
-      res.status(proxyRes.statusCode);
-      proxyRes.pipe(res).on('error', () => {});
-      return;
-    }
+    const fetchHeaders = MEDIAFLOW_URL ? { 'Accept-Encoding': 'identity' } : proxyHeaders;
+    const proxyReq = fetchClient.get(fetchUrl, { headers: fetchHeaders }, (proxyRes) => {
+      if (MEDIAFLOW_URL) {
+        console.log('MediaFlow response:', proxyRes.statusCode, 'ct:', proxyRes.headers['content-type'] || 'none', targetUrl.substring(0, 100));
+      }
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Headers', '*');
 
-    // If MediaFlow returned a playlist content-type, /proxy/stream won't deliver
-    // the body. Abort and re-fetch through the HLS manifest endpoint.
-    const contentType = proxyRes.headers['content-type'] || '';
-    const isPlaylist = contentType.includes('mpegurl') || contentType.includes('apple');
+      // Follow redirects (3xx)
+      if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+        const redirectUrl = new URL(proxyRes.headers.location, targetUrl).href;
+        proxyRes.resume();
+        const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+        res.redirect('/proxy?url=' + encodeURIComponent(redirectUrl) + refParam);
+        return;
+      }
 
-    if (MEDIAFLOW_URL && isPlaylist) {
-      proxyRes.destroy();
-      proxyReq.destroy();
-      console.log('Playlist detected from /proxy/stream, re-fetching via HLS endpoint:', targetUrl.substring(0, 100));
-      const mfHlsUrl = new URL(MEDIAFLOW_URL + '/proxy/hls/manifest.m3u8');
-      mfHlsUrl.searchParams.set('d', targetUrl);
-      if (MEDIAFLOW_API_PASSWORD) mfHlsUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
-      const hlsClient = mfHlsUrl.protocol === 'https:' ? https : http;
-      const hlsReq = hlsClient.get(mfHlsUrl.href, { headers: { 'Accept-Encoding': 'identity' } }, (hlsRes) => {
-        if (hlsRes.statusCode >= 400) {
-          hlsRes.resume();
-          if (!res.headersSent) res.status(hlsRes.statusCode).send('Playlist fetch failed');
-          return;
-        }
+      // Forward upstream errors
+      if (proxyRes.statusCode >= 400) {
+        console.error('Proxy upstream error:', proxyRes.statusCode, targetUrl.substring(0, 80));
+        res.status(proxyRes.statusCode);
+        proxyRes.pipe(res).on('error', () => {});
+        return;
+      }
+
+      // If MediaFlow returned a playlist content-type, /proxy/stream won't deliver
+      // the body. Abort and re-fetch through the HLS manifest endpoint.
+      const contentType = proxyRes.headers['content-type'] || '';
+      const isPlaylist = contentType.includes('mpegurl') || contentType.includes('apple');
+
+      if (MEDIAFLOW_URL && isPlaylist) {
+        proxyRes.destroy();
+        proxyReq.destroy();
+        console.log('Playlist detected from /proxy/stream, re-fetching via HLS endpoint:', targetUrl.substring(0, 100));
+        const mfHlsUrl = new URL(MEDIAFLOW_URL + '/proxy/hls/manifest.m3u8');
+        mfHlsUrl.searchParams.set('d', targetUrl);
+        if (MEDIAFLOW_API_PASSWORD) mfHlsUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+        const hlsClient = mfHlsUrl.protocol === 'https:' ? https : http;
+        const hlsReq = hlsClient.get(mfHlsUrl.href, { headers: { 'Accept-Encoding': 'identity' } }, (hlsRes) => {
+          if (hlsRes.statusCode >= 400) {
+            hlsRes.resume();
+            if (!res.headersSent) res.status(hlsRes.statusCode).send('Playlist fetch failed');
+            return;
+          }
+          let body = '';
+          hlsRes.setEncoding('utf8');
+          hlsRes.on('data', (chunk) => { body += chunk; });
+          hlsRes.on('end', () => {
+            console.log('HLS re-fetch body length:', body.length);
+            if (res.headersSent) return;
+            if (!body.trim().startsWith('#EXTM3U')) {
+              res.set('Content-Type', contentType);
+              res.send(body);
+              return;
+            }
+            const mfOrigin = new URL(MEDIAFLOW_URL).origin;
+            const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+            const rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
+              try {
+                const u = new URL(mfLink);
+                const originalUrl = u.searchParams.get('d');
+                if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
+              } catch (e) {}
+              return mfLink;
+            });
+            res.set('Content-Type', 'application/vnd.apple.mpegurl');
+            res.send(rewritten);
+          });
+          hlsRes.on('error', (err) => {
+            console.error('HLS re-fetch error:', err.message);
+            if (!res.headersSent) res.status(502).send('Playlist read error');
+          });
+        });
+        hlsReq.on('error', (err) => {
+          console.error('HLS re-fetch request error:', err.message);
+          if (!res.headersSent) res.status(502).send('Playlist fetch failed');
+        });
+        hlsReq.setTimeout(15000, () => {
+          hlsReq.destroy();
+          if (!res.headersSent) res.status(504).send('Playlist fetch timeout');
+        });
+        return;
+      }
+
+      if (isPlaylist) {
         let body = '';
-        hlsRes.setEncoding('utf8');
-        hlsRes.on('data', (chunk) => { body += chunk; });
-        hlsRes.on('end', () => {
-          console.log('HLS re-fetch body length:', body.length);
+        proxyRes.setEncoding('utf8');
+        proxyRes.on('data', (chunk) => { body += chunk; });
+        proxyRes.on('end', () => {
+          console.log('Playlist body length:', body.length);
           if (res.headersSent) return;
           if (!body.trim().startsWith('#EXTM3U')) {
-            res.set('Content-Type', contentType);
+            if (proxyRes.headers['content-type']) res.set('Content-Type', proxyRes.headers['content-type']);
             res.send(body);
             return;
           }
-          // Re-rewrite MediaFlow URLs to our proxy
-          const mfOrigin = new URL(MEDIAFLOW_URL).origin;
-          const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
-          const rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
-            try {
-              const u = new URL(mfLink);
-              const originalUrl = u.searchParams.get('d');
-              if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
-            } catch (e) {}
-            return mfLink;
-          });
+          const rewritten = rewritePlaylist(body);
           res.set('Content-Type', 'application/vnd.apple.mpegurl');
           res.send(rewritten);
         });
-        hlsRes.on('error', (err) => {
-          console.error('HLS re-fetch error:', err.message);
-          if (!res.headersSent) res.status(502).send('Playlist read error');
-        });
-      });
-      hlsReq.on('error', (err) => {
-        console.error('HLS re-fetch request error:', err.message);
-        if (!res.headersSent) res.status(502).send('Playlist fetch failed');
-      });
-      hlsReq.setTimeout(15000, () => {
-        hlsReq.destroy();
-        if (!res.headersSent) res.status(504).send('Playlist fetch timeout');
-      });
-      return;
-    }
-
-    if (isPlaylist) {
-      // Non-MediaFlow playlist handling
-      let body = '';
-      proxyRes.setEncoding('utf8');
-      proxyRes.on('data', (chunk) => { body += chunk; });
-      proxyRes.on('end', () => {
-        console.log('Playlist body length:', body.length);
-        if (res.headersSent) return;
-        if (!body.trim().startsWith('#EXTM3U')) {
-          if (proxyRes.headers['content-type']) res.set('Content-Type', proxyRes.headers['content-type']);
-          res.send(body);
-          return;
-        }
-        const rewritten = rewritePlaylist(body);
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(rewritten);
-      });
-    } else {
-      // Stream binary data (video segments, keys, etc.)
-      console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
+      } else {
+        // Stream binary data (video segments, keys, etc.)
+        console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
       // Forward status code (206 for partial content / range requests)
       res.status(proxyRes.statusCode);
       if (proxyRes.headers['content-type']) {
@@ -1074,21 +1075,28 @@ app.get('/proxy', (req, res) => {
     }
   });
 
-  proxyReq.on('error', (err) => {
-    console.error('Proxy error:', err.message);
-    if (!res.headersSent) res.status(502).send('Proxy error');
-  });
+    proxyReq.on('error', (err) => {
+      console.error('Proxy error:', err.message, 'attempt:', attempt);
+      if (MEDIAFLOW_URL && attempt < 3 && !res.headersSent) {
+        console.log('Retrying MediaFlow request...');
+        setTimeout(() => doProxyRequest(attempt + 1), 500 * attempt);
+      } else if (!res.headersSent) {
+        res.status(502).send('Proxy error');
+      }
+    });
 
-  proxyReq.setTimeout(MEDIAFLOW_URL ? 30000 : 15000, () => {
-    proxyReq.destroy();
-    console.error('Proxy timeout:', targetUrl.substring(0, 80));
-    if (!res.headersSent) res.status(504).send('Proxy timeout');
-  });
+    proxyReq.setTimeout(MEDIAFLOW_URL ? 30000 : 15000, () => {
+      proxyReq.destroy();
+      console.error('Proxy timeout:', targetUrl.substring(0, 80));
+      if (!res.headersSent) res.status(504).send('Proxy timeout');
+    });
 
-  // If the client disconnects, clean up the upstream request
-  req.on('close', () => {
-    proxyReq.destroy();
-  });
+    req.on('close', () => {
+      proxyReq.destroy();
+    });
+  };
+
+  doProxyRequest(1);
 });
 
 // Store room state
