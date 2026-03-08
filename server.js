@@ -904,22 +904,6 @@ app.get('/proxy', (req, res) => {
         const isMaster = body.includes('#EXT-X-STREAM-INF') || body.includes('#EXT-X-MEDIA');
         const playlistHint = isMaster ? '&playlist=1' : '';
 
-        // For master playlists, filter out 1080p to avoid socket hang ups on MediaFlow
-        if (isMaster) {
-          const lines = body.split('\n');
-          const filtered = [];
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes('RESOLUTION=') && /1920x|1080/.test(lines[i])) {
-              i++; // skip the URL line after #EXT-X-STREAM-INF
-              continue;
-            }
-            // Also filter 1080p from #EXT-X-MEDIA renditions
-            if (lines[i].includes('rendition=1080p')) continue;
-            filtered.push(lines[i]);
-          }
-          body = filtered.join('\n');
-        }
-
         let rewritten;
         if (MEDIAFLOW_URL) {
           // MediaFlow rewrites URLs to point through itself. Re-rewrite through our proxy.
