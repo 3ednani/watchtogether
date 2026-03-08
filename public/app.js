@@ -830,6 +830,11 @@ function startTranscodeSession(url, referer, broadcast) {
         if (engIdx > 0) {
           currentAudioTrack = engIdx;
           currentTranscode.audioTrack = engIdx;
+          // Update button UI to reflect the auto-selected track
+          var btns = audioTracks.querySelectorAll('.sub-track-btn');
+          for (var j = 0; j < btns.length; j++) {
+            btns[j].classList.toggle('active', j === engIdx);
+          }
         }
       }
 
@@ -1425,6 +1430,7 @@ function addAudioButton(label, trackIndex) {
   btn.className = 'sub-track-btn' + (trackIndex === currentAudioTrack ? ' active' : '');
   btn.addEventListener('click', function() {
     if (!currentTranscode) return;
+    if (currentAudioTrack === trackIndex) return;
     currentAudioTrack = trackIndex;
     currentTranscode.audioTrack = trackIndex;
     var btns = audioTracks.querySelectorAll('.sub-track-btn');
@@ -1515,8 +1521,8 @@ function detectHLSSubtitles() {
         btn.textContent = lbl;
         btn.className = 'sub-track-btn';
         btn.addEventListener('click', function() {
-          hls.subtitleTrack = index;
           disableAllSubs();
+          hls.subtitleTrack = index;
           if (video.textTracks[index]) {
             video.textTracks[index].mode = 'showing';
           }
