@@ -4,9 +4,6 @@ function setIcon(el, iconName) {
   if (typeof lucide !== 'undefined') lucide.createIcons({ nodes: [el] });
 }
 
-// --- Remux session state ---
-var currentRemuxSessionId = null;
-
 // --- DOM Elements ---
 var lobby = document.getElementById('lobby');
 var roomScreen = document.getElementById('room');
@@ -199,9 +196,9 @@ function startHeartbeat() {
         });
       }
     } else {
-      if (!video.paused && video.duration) {
+      if (!video.paused && getRealDuration()) {
         socket.emit('sync-heartbeat', {
-          currentTime: video.currentTime,
+          currentTime: getRealTime(),
           sentAt: Date.now()
         });
       }
@@ -231,19 +228,23 @@ socket.on('sync-heartbeat', function(data) {
     }
     return;
   }
-  if (video.paused || !video.duration) return;
+  if (video.paused || !getRealDuration()) return;
   // Don't correct more than once every 15s to avoid feedback loops
   var now = Date.now();
   if (now - lastCorrectionTime < 15000) return;
 
   var networkDelay = (now - data.sentAt) / 1000;
   var partnerTime = data.currentTime + networkDelay;
-  var drift = partnerTime - video.currentTime;
+  var drift = partnerTime - getRealTime();
 
   // Only correct if significantly out of sync (>2s)
   if (Math.abs(drift) > DRIFT_THRESHOLD) {
     lastCorrectionTime = now;
-    video.currentTime = partnerTime;
+    if (currentTranscode) {
+      loadTranscodedStream(currentTranscode.url, currentTranscode.referer, partnerTime, currentAudioTrack);
+    } else {
+      video.currentTime = partnerTime;
+    }
     syncStatus.textContent = 'Resynced (' + (drift > 0 ? '+' : '') + drift.toFixed(1) + 's)';
   }
 });
@@ -715,9 +716,9 @@ function selectStream(stream) {
 
   var isHlsStream = url.includes('.m3u8');
 
-  // For non-HLS streams with FFmpeg: full HLS remux (video + audio + subs)
+  // For non-HLS streams with FFmpeg: transcode to fragmented MP4
   if (!isHlsStream && serverHasFFmpeg) {
-    startRemuxSession(url, referer);
+    startTranscodeSession(url, referer);
   } else {
     // HLS or no FFmpeg: proxy and play directly
     var proxyVideoUrl = '/proxy?url=' + encodeURIComponent(url);
@@ -730,116 +731,173 @@ function selectStream(stream) {
   }
 }
 
-var loadRemuxRetries = 0;
-function loadRemuxTracks(sessionId) {
-  loadRemuxRetries++;
-  if (loadRemuxRetries > 20) return; // stop after ~60s
-  fetch('/remux/' + sessionId + '/info')
-    .then(function(r) { return r.json(); })
-    .then(function(info) {
-      if (info.subtitles && info.subtitles.length > 0) {
-        var readySubs = info.subtitles.filter(function(s) { return s.ready; });
-        if (readySubs.length > 0) {
-          clearSubtitleUI();
-          var engSubBtn = null;
-          var engSubIdx = -1;
-          readySubs.forEach(function(sub) {
-            var track = document.createElement('track');
-            track.kind = 'subtitles';
-            track.label = sub.title + ' (' + sub.lang + ')';
-            track.srclang = sub.lang;
-            track.src = sub.url;
-            track.setAttribute('data-external', 'true');
-            video.appendChild(track);
-            var idx = video.textTracks.length - 1;
-            addSubtitleButton(track.label, idx);
-            if (engSubBtn === null && (isEnglish(sub.lang) || isEnglish(sub.title))) {
-              engSubBtn = subTracks.lastChild;
-              engSubIdx = idx;
-            }
-          });
-          // Auto-select English subtitle
-          if (engSubBtn && engSubIdx !== -1) {
-            disableAllSubs();
-            video.textTracks[engSubIdx].mode = 'showing';
-            setActiveSubBtn(engSubBtn);
-          }
-          broadcastSubtitleTrackList();
-          console.log('Loaded ' + readySubs.length + ' subtitle tracks from remux');
-        } else {
-          setTimeout(function() { loadRemuxTracks(sessionId); }, 3000);
-        }
+// --- Transcode state ---
+var currentTranscode = null; // { url, referer, duration, meta, audioTrack }
+var currentAudioTrack = 0;
+var transcodeDisplayTimer = null;
+var transcodeWallStart = 0; // Date.now() when stream started playing
+var transcodeTimeOffset = 0; // absolute start time of current stream
+
+function startTranscodeDisplayLoop() {
+  stopTranscodeDisplayLoop();
+  transcodeDisplayTimer = setInterval(function() {
+    if (!currentTranscode) { stopTranscodeDisplayLoop(); return; }
+    // Hide spinner and start wall clock once video has data
+    if (video.currentTime > 0 || video.readyState >= 2) {
+      hideSpinner();
+      // Start wall clock on first data arrival (not before)
+      if (transcodeWallStart === 0 && !video.paused) {
+        transcodeWallStart = Date.now();
       }
-    })
-    .catch(function(err) {
-      console.warn('Failed to load remux track info:', err);
-    });
+    }
+    // Update progress bar and time display
+    var dur = getRealDuration();
+    var time = getRealTime();
+    if (dur && dur > 0 && isFinite(dur)) {
+      var pct = (time / dur) * 100;
+      progressFill.style.width = pct + '%';
+      progressThumb.style.left = pct + '%';
+      timeDisplay.textContent = formatTime(time) + ' / ' + formatTime(dur);
+    } else {
+      timeDisplay.textContent = formatTime(time) + ' / --:--';
+    }
+  }, 250);
 }
 
-function startRemuxSession(url, referer) {
-  syncStatus.textContent = 'Preparing stream...';
+function stopTranscodeDisplayLoop() {
+  if (transcodeDisplayTimer) {
+    clearInterval(transcodeDisplayTimer);
+    transcodeDisplayTimer = null;
+  }
+}
 
-  var remuxUrl = '/remux?url=' + encodeURIComponent(url);
-  if (referer) remuxUrl += '&referer=' + encodeURIComponent(referer);
-  if (roomId) remuxUrl += '&room=' + encodeURIComponent(roomId);
+function getRealTime() {
+  if (!currentTranscode) return video.currentTime;
+  // Use wall-clock elapsed time (video.currentTime is unreliable for chunked fMP4)
+  if (transcodeWallStart > 0 && !video.paused) {
+    var elapsed = (Date.now() - transcodeWallStart) / 1000;
+    return transcodeTimeOffset + elapsed;
+  }
+  // Fallback: URL offset + video.currentTime (used when paused)
+  try {
+    var params = new URL(video.src, location.origin).searchParams;
+    return parseFloat(params.get('t') || 0) + video.currentTime;
+  } catch(e) { return video.currentTime; }
+}
 
-  fetch(remuxUrl)
+function getRealDuration() {
+  if (currentTranscode && currentTranscode.duration > 0) return currentTranscode.duration;
+  return video.duration;
+}
+
+function startTranscodeSession(url, referer, broadcast) {
+  if (broadcast === undefined) broadcast = true;
+  syncStatus.textContent = 'Loading stream...';
+  showSpinner();
+
+  var metaUrl = '/transcode/metadata?url=' + encodeURIComponent(url);
+  if (referer) metaUrl += '&referer=' + encodeURIComponent(referer);
+
+  fetch(metaUrl)
     .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) {
-        console.warn('Remux error:', data.error);
-        // Fallback: try direct URL first (uses client's IP, avoids datacenter blocking),
-        // HLS.js will fall back to proxy automatically if CORS fails
+    .then(function(meta) {
+      if (meta.error) {
+        console.warn('Transcode probe error:', meta.error);
         loadVideo(url, true);
         return;
       }
-      currentRemuxSessionId = data.sessionId;
-      if (data.ready) {
-        loadRemuxedVideo(data.sessionId);
-      } else {
-        pollRemuxReady(data.sessionId, url);
+      currentTranscode = { url: url, referer: referer, duration: meta.duration, meta: meta, audioTrack: 0 };
+      currentAudioTrack = 0;
+
+      // Broadcast video to partner (send original URL + referer so they can transcode too)
+      if (broadcast) {
+        socket.emit('set-video', { url: url, referer: referer, transcode: true });
       }
+
+      // Broadcast duration for remote mode
+      if (meta.duration > 0) {
+        socket.emit('set-duration', { duration: meta.duration });
+      }
+
+      // Load audio track buttons
+      if (meta.audioTracks && meta.audioTracks.length > 1) {
+        clearAudioUI();
+        meta.audioTracks.forEach(function(track, i) {
+          addAudioButton(track.title + ' (' + track.lang + ')', i);
+        });
+        // Auto-select English audio
+        var engIdx = meta.audioTracks.findIndex(function(t) { return isEnglish(t.lang) || isEnglish(t.title); });
+        if (engIdx > 0) {
+          currentAudioTrack = engIdx;
+          currentTranscode.audioTrack = engIdx;
+        }
+      }
+
+      loadTranscodedStream(url, referer, 0, currentAudioTrack);
+      loadTranscodeSubtitles(url, referer, meta.subtitleTracks || []);
     })
     .catch(function(err) {
-      console.warn('Remux request failed:', err);
+      console.warn('Transcode request failed:', err);
       loadVideo(url, true);
     });
 }
 
-function pollRemuxReady(sessionId, url) {
-  var attempts = 0;
-  var pollTimer = setInterval(function() {
-    attempts++;
-    if (attempts > 120) { // 60 seconds
-      clearInterval(pollTimer);
-      syncStatus.textContent = 'Remux timeout, trying direct...';
-      loadVideo(url, true);
-      return;
-    }
-    fetch('/remux/' + sessionId + '/status')
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (data.ready) {
-          clearInterval(pollTimer);
-          loadRemuxedVideo(sessionId);
-        } else if (data.state === 'error') {
-          clearInterval(pollTimer);
-          syncStatus.textContent = 'Remux failed, trying direct...';
-          loadVideo(url, true);
-        } else {
-          syncStatus.textContent = 'Preparing stream...';
-        }
-      })
-      .catch(function() {});
-  }, 500);
+function loadTranscodedStream(url, referer, startTime, audioTrack) {
+  if (hls) { hls.destroy(); hls = null; }
+
+  var streamUrl = '/transcode/stream?url=' + encodeURIComponent(url)
+    + '&t=' + startTime + '&audio=' + audioTrack;
+  if (referer) streamUrl += '&referer=' + encodeURIComponent(referer);
+
+  video.src = streamUrl;
+  video.load();
+  video.play().catch(function() {});
+
+  // Track time via wall clock since video.currentTime is unreliable for chunked fMP4
+  transcodeTimeOffset = startTime;
+  transcodeWallStart = 0; // will be set when playback actually starts (spinner hides)
+
+  showSpinner();
+  playerContainer.classList.remove('hidden');
+  playerContainer.style.display = '';
+  syncStatus.textContent = '';
+  startTranscodeDisplayLoop();
 }
 
-function loadRemuxedVideo(sessionId) {
-  var masterUrl = '/remux/' + sessionId + '/master.m3u8';
-  loadVideo(masterUrl, true);
-  // Load subtitle tracks after a delay (they extract in background)
-  loadRemuxRetries = 0;
-  setTimeout(function() { loadRemuxTracks(sessionId); }, 2000);
+function loadTranscodeSubtitles(url, referer, subtitleTracks) {
+  if (!subtitleTracks || subtitleTracks.length === 0) return;
+  clearSubtitleUI();
+  var engSubBtn = null;
+  var engSubIdx = -1;
+
+  subtitleTracks.forEach(function(sub, i) {
+    var subUrl = '/transcode/subtitles?url=' + encodeURIComponent(url)
+      + '&track=' + i;
+    if (referer) subUrl += '&referer=' + encodeURIComponent(referer);
+
+    var track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.label = sub.title + ' (' + sub.lang + ')';
+    track.srclang = sub.lang;
+    track.src = subUrl;
+    track.setAttribute('data-external', 'true');
+    video.appendChild(track);
+
+    var idx = video.textTracks.length - 1;
+    addSubtitleButton(track.label, idx);
+    if (engSubBtn === null && (isEnglish(sub.lang) || isEnglish(sub.title))) {
+      engSubBtn = subTracks.lastChild;
+      engSubIdx = idx;
+    }
+  });
+
+  // Auto-select English subtitle
+  if (engSubBtn && engSubIdx !== -1) {
+    disableAllSubs();
+    video.textTracks[engSubIdx].mode = 'showing';
+    setActiveSubBtn(engSubBtn);
+  }
+  broadcastSubtitleTrackList();
 }
 
 // Back button — from detail to search results
@@ -888,6 +946,11 @@ function loadVideo(url, broadcast) {
     }
     return;
   }
+
+  // Clear transcode state when loading a non-transcode video
+  currentTranscode = null;
+  currentAudioTrack = 0;
+  stopTranscodeDisplayLoop();
 
   // Show spinner while loading
   showSpinner();
@@ -1151,12 +1214,12 @@ document.addEventListener('touchend', function() {
 btnPlayPause.addEventListener('click', function() {
   if (video.paused) {
     if (!safePlay()) return; // blocked — audio not ready yet
-    socket.emit('play', { currentTime: video.currentTime, sentAt: Date.now() });
+    socket.emit('play', { currentTime: getRealTime(), sentAt: Date.now() });
     syncStatus.textContent = 'Playing (synced)';
     startHeartbeat();
   } else {
     video.pause();
-    socket.emit('pause', { currentTime: video.currentTime, sentAt: Date.now() });
+    socket.emit('pause', { currentTime: getRealTime(), sentAt: Date.now() });
     syncStatus.textContent = 'Paused (synced)';
     stopHeartbeat();
   }
@@ -1164,9 +1227,19 @@ btnPlayPause.addEventListener('click', function() {
 
 video.addEventListener('play', function() {
   setIcon(btnPlayPause, 'pause');
+  // Resume wall clock when resuming from pause (transcodeTimeOffset was frozen by pause handler)
+  if (currentTranscode && video.readyState >= 2) {
+    transcodeWallStart = Date.now();
+  }
+  // If readyState < 2 (no data yet), the display loop will start the wall clock when data arrives
 });
 video.addEventListener('pause', function() {
   setIcon(btnPlayPause, 'play');
+  // Freeze wall clock at current time
+  if (currentTranscode && transcodeWallStart > 0) {
+    transcodeTimeOffset = getRealTime();
+    transcodeWallStart = 0;
+  }
 });
 
 // --- Loading Spinner ---
@@ -1184,36 +1257,28 @@ video.addEventListener('playing', hideSpinner);
 video.addEventListener('seeked', hideSpinner);
 video.addEventListener('error', hideSpinner);
 
-// Notify remux server when user seeks so FFmpeg restarts at the right position
-var _seekNotifyTimer = null;
-video.addEventListener('seeking', function() {
-  if (!currentRemuxSessionId) return;
-  var targetSegment = Math.floor(video.currentTime / 4); // 4s segment duration
-  if (_seekNotifyTimer) clearTimeout(_seekNotifyTimer);
-  _seekNotifyTimer = setTimeout(function() {
-    fetch('/remux/' + currentRemuxSessionId + '/seek?segment=' + targetSegment)
-      .then(function(r) { return r.json(); })
-      .then(function(d) { console.log('Seek notify:', d.status, 'seg', d.segment); })
-      .catch(function() {});
-  }, 150);
-});
-
 // --- Progress Bar ---
 video.addEventListener('timeupdate', function() {
-  if (video.duration) {
-    var pct = (video.currentTime / video.duration) * 100;
+  var dur = getRealDuration();
+  if (dur) {
+    var pct = (getRealTime() / dur) * 100;
     progressFill.style.width = pct + '%';
     progressThumb.style.left = pct + '%';
-    timeDisplay.textContent = formatTime(video.currentTime) + ' / ' + formatTime(video.duration);
+    timeDisplay.textContent = formatTime(getRealTime()) + ' / ' + formatTime(getRealDuration());
   }
 });
 
 progressBar.addEventListener('click', function(e) {
-  if (!video.duration) return;
+  var dur = getRealDuration();
+  if (!dur) return;
   var rect = progressBar.getBoundingClientRect();
   var pct = (e.clientX - rect.left) / rect.width;
-  var newTime = pct * video.duration;
-  video.currentTime = newTime;
+  var newTime = pct * dur;
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, newTime, currentAudioTrack);
+  } else {
+    video.currentTime = newTime;
+  }
   socket.emit('seek', { currentTime: newTime, sentAt: Date.now() });
   syncStatus.textContent = 'Seeked (synced)';
 });
@@ -1223,17 +1288,25 @@ var btnSkipBack = document.getElementById('btn-skip-back');
 var btnSkipFwd = document.getElementById('btn-skip-fwd');
 
 btnSkipBack.addEventListener('click', function() {
-  if (!video.duration) return;
-  var t = Math.max(0, video.currentTime - 10);
-  video.currentTime = t;
+  if (!getRealDuration()) return;
+  var t = Math.max(0, getRealTime() - 10);
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, t, currentAudioTrack);
+  } else {
+    video.currentTime = t;
+  }
   socket.emit('seek', { currentTime: t, sentAt: Date.now() });
   syncStatus.textContent = 'Seeked -10s (synced)';
 });
 
 btnSkipFwd.addEventListener('click', function() {
-  if (!video.duration) return;
-  var t = Math.min(video.duration, video.currentTime + 10);
-  video.currentTime = t;
+  if (!getRealDuration()) return;
+  var t = Math.min(getRealDuration(), getRealTime() + 10);
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, t, currentAudioTrack);
+  } else {
+    video.currentTime = t;
+  }
   socket.emit('seek', { currentTime: t, sentAt: Date.now() });
   syncStatus.textContent = 'Seeked +10s (synced)';
 });
@@ -1243,17 +1316,25 @@ var btnSkipBackCtrl = document.getElementById('btn-skip-back-ctrl');
 var btnSkipFwdCtrl = document.getElementById('btn-skip-fwd-ctrl');
 
 btnSkipBackCtrl.addEventListener('click', function() {
-  if (!video.duration) return;
-  var t = Math.max(0, video.currentTime - 10);
-  video.currentTime = t;
+  if (!getRealDuration()) return;
+  var t = Math.max(0, getRealTime() - 10);
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, t, currentAudioTrack);
+  } else {
+    video.currentTime = t;
+  }
   socket.emit('seek', { currentTime: t, sentAt: Date.now() });
   syncStatus.textContent = 'Seeked -10s (synced)';
 });
 
 btnSkipFwdCtrl.addEventListener('click', function() {
-  if (!video.duration) return;
-  var t = Math.min(video.duration, video.currentTime + 10);
-  video.currentTime = t;
+  if (!getRealDuration()) return;
+  var t = Math.min(getRealDuration(), getRealTime() + 10);
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, t, currentAudioTrack);
+  } else {
+    video.currentTime = t;
+  }
   socket.emit('seek', { currentTime: t, sentAt: Date.now() });
   syncStatus.textContent = 'Seeked +10s (synced)';
 });
@@ -1329,6 +1410,29 @@ function isEnglish(str) {
   if (!str) return false;
   var s = str.toLowerCase();
   return s === 'eng' || s === 'en' || s === 'english';
+}
+
+function clearAudioUI() {
+  audioTracks.innerHTML = '';
+  btnAudio.classList.add('hidden');
+  audioMenu.classList.add('hidden');
+}
+
+function addAudioButton(label, trackIndex) {
+  btnAudio.classList.remove('hidden');
+  var btn = document.createElement('button');
+  btn.textContent = label;
+  btn.className = 'sub-track-btn' + (trackIndex === currentAudioTrack ? ' active' : '');
+  btn.addEventListener('click', function() {
+    if (!currentTranscode) return;
+    currentAudioTrack = trackIndex;
+    currentTranscode.audioTrack = trackIndex;
+    var btns = audioTracks.querySelectorAll('.sub-track-btn');
+    for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
+    btn.classList.add('active');
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, getRealTime(), trackIndex);
+  });
+  audioTracks.appendChild(btn);
 }
 
 function clearSubtitleUI() {
@@ -1667,9 +1771,12 @@ remoteInputSubFile.addEventListener('change', function() {
 // Re-detect subs and audio when video loads
 video.addEventListener('loadedmetadata', function() {
   // Broadcast duration to room (useful for remote mode clients)
-  if (video.duration && isFinite(video.duration)) {
-    socket.emit('set-duration', { duration: video.duration });
+  var realDur = getRealDuration();
+  if (realDur && isFinite(realDur)) {
+    socket.emit('set-duration', { duration: realDur });
   }
+  // Skip HLS track detection in transcode mode — tracks are already set up
+  if (currentTranscode) return;
   setTimeout(function() {
     detectHLSSubtitles();
     detectHLSAudioTracks();
@@ -1709,11 +1816,15 @@ socket.on('room-state', function(state) {
     return;
   }
   if (state.videoUrl) {
-    loadVideo(state.videoUrl, false);
-    video.currentTime = state.currentTime || 0;
-    if (state.playing) {
-      safePlay();
-      syncStatus.textContent = 'Playing (synced)';
+    if (state.isTranscode && serverHasFFmpeg) {
+      startTranscodeSession(state.videoUrl, state.videoReferer || '', false);
+    } else {
+      loadVideo(state.videoUrl, false);
+      video.currentTime = state.currentTime || 0;
+      if (state.playing) {
+        safePlay();
+        syncStatus.textContent = 'Playing (synced)';
+      }
     }
   }
   // Restore subtitles for late joiners
@@ -1732,7 +1843,15 @@ socket.on('set-video', function(data) {
   // Hide browse UI when partner loads a video
   searchResults.classList.add('hidden');
   contentDetail.classList.add('hidden');
-  loadVideo(data.url, false);
+  if (isRemoteMode()) {
+    // Remote mode doesn't load video, just track state
+    loadVideo(data.url, false);
+  } else if (data.transcode && serverHasFFmpeg) {
+    // Partner started a transcode session — start our own
+    startTranscodeSession(data.url, data.referer || '', false);
+  } else {
+    loadVideo(data.url, false);
+  }
   showToast('Partner loaded a video');
 });
 
@@ -1767,7 +1886,11 @@ socket.on('broadcast-subtitle-tracks', function(data) {
 socket.on('select-audio-track', function(data) {
   if (isRemoteMode()) return;
   var index = data.index;
-  if (hls && hls.audioTracks && hls.audioTracks.length > index) {
+  if (currentTranscode) {
+    currentAudioTrack = index;
+    currentTranscode.audioTrack = index;
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, getRealTime(), index);
+  } else if (hls && hls.audioTracks && hls.audioTracks.length > index) {
     hls.audioTrack = index;
   } else if (video.audioTracks && video.audioTracks.length > index) {
     for (var k = 0; k < video.audioTracks.length; k++) {
@@ -1818,8 +1941,13 @@ socket.on('play', function(data) {
   ignoreEvents = true;
   // Compensate for network delay — video kept playing on partner's side
   var delay = data.sentAt ? (Date.now() - data.sentAt) / 1000 : 0;
-  video.currentTime = data.currentTime + delay;
-  safePlay();
+  var targetTime = data.currentTime + delay;
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, targetTime, currentAudioTrack);
+  } else {
+    video.currentTime = targetTime;
+    safePlay();
+  }
   ignoreEvents = false;
   syncStatus.textContent = 'Playing (synced)';
   showToast('Partner pressed play');
@@ -1840,7 +1968,9 @@ socket.on('pause', function(data) {
   }
   ignoreEvents = true;
   video.pause();
-  video.currentTime = data.currentTime;
+  if (!currentTranscode) {
+    video.currentTime = data.currentTime;
+  }
   ignoreEvents = false;
   syncStatus.textContent = 'Paused (synced)';
   showToast('Partner paused');
@@ -1856,7 +1986,11 @@ socket.on('seek', function(data) {
     return;
   }
   ignoreEvents = true;
-  video.currentTime = data.currentTime;
+  if (currentTranscode) {
+    loadTranscodedStream(currentTranscode.url, currentTranscode.referer, data.currentTime, currentAudioTrack);
+  } else {
+    video.currentTime = data.currentTime;
+  }
   ignoreEvents = false;
   syncStatus.textContent = 'Seeked (synced)';
   showToast('Partner seeked');
@@ -1998,15 +2132,23 @@ document.addEventListener('keydown', function(e) {
       break;
     case 'ArrowLeft':
       e.preventDefault();
-      var back = Math.max(0, video.currentTime - 10);
-      video.currentTime = back;
+      var back = Math.max(0, getRealTime() - 10);
+      if (currentTranscode) {
+        loadTranscodedStream(currentTranscode.url, currentTranscode.referer, back, currentAudioTrack);
+      } else {
+        video.currentTime = back;
+      }
       socket.emit('seek', { currentTime: back, sentAt: Date.now() });
       syncStatus.textContent = 'Seeked -10s (synced)';
       break;
     case 'ArrowRight':
       e.preventDefault();
-      var fwd = Math.min(video.duration || 0, video.currentTime + 10);
-      video.currentTime = fwd;
+      var fwd = Math.min(getRealDuration() || 0, getRealTime() + 10);
+      if (currentTranscode) {
+        loadTranscodedStream(currentTranscode.url, currentTranscode.referer, fwd, currentAudioTrack);
+      } else {
+        video.currentTime = fwd;
+      }
       socket.emit('seek', { currentTime: fwd, sentAt: Date.now() });
       syncStatus.textContent = 'Seeked +10s (synced)';
       break;

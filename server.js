@@ -92,19 +92,8 @@ if (MEDIAFLOW_URL) {
   console.log('MediaFlow Proxy configured:', MEDIAFLOW_URL);
 }
 
-// --- Remux session management ---
-const remuxSessions = new Map();
-const REMUX_DIR = path.join(os.tmpdir(), 'watch-together-remux');
-const MAX_REMUX_SESSIONS = 3;
-const SEGMENT_DURATION = 4; // seconds per HLS segment
-
-if (ffmpegAvailable) {
-  try { fs.mkdirSync(REMUX_DIR, { recursive: true }); } catch (e) {}
-}
-
-function sanitizeName(name) {
-  return (name || 'track').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30) || 'track';
-}
+// --- Transcode stream management ---
+const transcodeStreams = new Map(); // streamKey -> { process, url, startTime }
 
 function probeInput(url, referer) {
   return new Promise((resolve, reject) => {
@@ -128,329 +117,127 @@ function probeInput(url, referer) {
   });
 }
 
-function extractSubtitles(sessionId, session, url, referer, subtitleStreams) {
-  if (subtitleStreams.length === 0) return;
-  session.subtitles = [];
 
+// Metadata cache for probed streams
+const metadataCache = new Map(); // url -> metadata
+
+// Helper: get stream key from URL
+function getStreamKey(url) {
+  return crypto.createHash('md5').update(url).digest('hex').substring(0, 12);
+}
+
+// Helper: probe and cache metadata
+async function getOrProbeMetadata(url, referer) {
+  if (metadataCache.has(url)) return metadataCache.get(url);
+  const probeInfo = await probeInput(url, referer);
+  const streams = probeInfo.streams || [];
+  const videoStreams = streams.filter(s => s.codec_type === 'video');
+  const audioStreams = streams.filter(s => s.codec_type === 'audio');
+  const textSubCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text', 'text'];
+  const subtitleStreams = streams.filter(s =>
+    s.codec_type === 'subtitle' && textSubCodecs.includes(s.codec_name)
+  );
+
+  let duration = parseFloat(probeInfo.format?.duration) || 0;
+  if (!duration && videoStreams.length > 0) {
+    duration = parseFloat(videoStreams[0].duration) || 0;
+  }
+
+  const videoCodec = videoStreams[0]?.codec_name || 'unknown';
+  const needsTranscode = videoCodec !== 'h264';
+  const webAudioCodecs = ['aac', 'mp3', 'opus'];
+
+  const metadata = {
+    duration,
+    videoCodec,
+    needsTranscode,
+    width: videoStreams[0]?.width || 0,
+    height: videoStreams[0]?.height || 0,
+    audioTracks: audioStreams.map((a, i) => ({
+      index: i,
+      codec: a.codec_name,
+      lang: a.tags?.language || 'und',
+      title: a.tags?.title || a.tags?.language || `Track ${i + 1}`,
+      needsTranscode: !webAudioCodecs.includes(a.codec_name?.toLowerCase())
+    })),
+    subtitleTracks: subtitleStreams.map((s, i) => ({
+      index: i,
+      streamIndex: s.index,
+      lang: s.tags?.language || 'und',
+      title: s.tags?.title || s.tags?.language || `Sub ${i + 1}`
+    }))
+  };
+
+  console.log(`[Transcode] Probe: duration=${duration.toFixed(1)}s, video=${videoCodec}${needsTranscode ? '->transcode' : '->copy'}, ${audioStreams.length} audio, ${subtitleStreams.length} subs`);
+  metadataCache.set(url, metadata);
+  return metadata;
+}
+
+// Helper: build FFmpeg args for fragmented MP4 streaming
+function buildTranscodeArgs(url, referer, startTime, audioTrack, metadata) {
   const headerStr = referer
     ? `Referer: ${referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
     : `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`;
 
-  subtitleStreams.forEach((sub, i) => {
-    const lang = sub.tags?.language || 'und';
-    const title = sub.tags?.title || sub.tags?.language || `Sub_${i + 1}`;
-    const vttFile = path.join(session.dir, `sub_${i}.vtt`);
-    const subInfo = { index: i, lang, title, file: `sub_${i}.vtt`, ready: false };
-    session.subtitles.push(subInfo);
+  const args = ['-hide_banner', '-loglevel', 'error'];
 
-    const args = [
-      '-headers', headerStr,
-      '-i', url,
-      '-map', `0:${sub.index}`,
-      '-c:s', 'webvtt',
-      '-f', 'webvtt',
-      vttFile
-    ];
-
-    const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    proc.on('close', (code) => {
-      if (code === 0 && fs.existsSync(vttFile)) {
-        subInfo.ready = true;
-        console.log(`Remux ${sessionId}: subtitle ${i} (${title}) extracted`);
-      } else {
-        console.warn(`Remux ${sessionId}: subtitle ${i} extraction failed (code ${code})`);
-      }
-    });
-    proc.on('error', () => {});
-  });
-}
-
-function writeMasterPlaylist(session, audioStreams) {
-  let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
-  if (audioStreams.length > 0) {
-    audioStreams.forEach((audio, i) => {
-      const lang = (audio.tags?.language || 'und').replace(/"/g, '');
-      const title = (audio.tags?.title || audio.tags?.language || `Track ${i + 1}`).replace(/"/g, '');
-      const isDefault = i === 0 ? 'YES' : 'NO';
-      playlist += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${title}",LANGUAGE="${lang}",DEFAULT=${isDefault},AUTOSELECT=YES,URI="a${i}.m3u8"\n`;
-    });
-    playlist += `\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO="audio"\n`;
-  } else {
-    playlist += '#EXT-X-STREAM-INF:BANDWIDTH=5000000\n';
+  // Hardware decoding
+  if (metadata.needsTranscode && hwEncoder) {
+    if (hwEncoder.hwaccel === 'cuda') args.push('-hwaccel', 'cuda');
+    else if (hwEncoder.hwaccel === 'qsv') args.push('-hwaccel', 'qsv');
+    else if (hwEncoder.hwaccel === 'd3d11va') args.push('-hwaccel', 'd3d11va');
   }
-  playlist += 'video.m3u8\n';
-  fs.writeFileSync(path.join(session.dir, 'master.m3u8'), playlist);
-}
 
-function generateVodPlaylist(totalSegments, segmentDuration, duration, segmentPrefix) {
-  let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n';
-  playlist += '#EXT-X-TARGETDURATION:' + Math.ceil(segmentDuration) + '\n';
-  playlist += '#EXT-X-MEDIA-SEQUENCE:0\n';
-  playlist += '#EXT-X-PLAYLIST-TYPE:VOD\n';
-  for (let i = 0; i < totalSegments; i++) {
-    const isLast = i === totalSegments - 1;
-    const segDur = isLast ? Math.max(0.1, duration - i * segmentDuration) : segmentDuration;
-    playlist += '#EXTINF:' + segDur.toFixed(6) + ',\n';
-    playlist += segmentPrefix + String(i).padStart(4, '0') + '.ts\n';
-  }
-  playlist += '#EXT-X-ENDLIST\n';
-  return playlist;
-}
-
-function startRemux(sessionId, session, url, referer) {
-  probeInput(url, referer).then((probeInfo) => {
-    session.probeData = probeInfo;
-    const streams = probeInfo.streams || [];
-    const videoStreams = streams.filter(s => s.codec_type === 'video');
-    const audioStreams = streams.filter(s => s.codec_type === 'audio');
-    const textSubCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text', 'text'];
-    const subtitleStreams = streams.filter(s =>
-      s.codec_type === 'subtitle' && textSubCodecs.includes(s.codec_name)
-    );
-
-    // Get duration from format (most reliable) or video stream
-    let duration = 0;
-    if (probeInfo.format && probeInfo.format.duration) {
-      duration = parseFloat(probeInfo.format.duration);
-    }
-    if (!duration && videoStreams.length > 0 && videoStreams[0].duration) {
-      duration = parseFloat(videoStreams[0].duration);
-    }
-    if (!duration || !isFinite(duration) || duration <= 0) {
-      session.state = 'error';
-      session.error = 'Could not determine video duration';
-      console.error(`Remux ${sessionId}: could not determine duration`);
-      return;
-    }
-
-    const videoCodec = videoStreams.length > 0 ? videoStreams[0].codec_name : 'unknown';
-    const needsVideoTranscode = videoCodec !== 'h264';
-
-    // Store session metadata for on-demand seeking
-    session.duration = duration;
-    session.segmentDuration = SEGMENT_DURATION;
-    session.totalSegments = Math.ceil(duration / SEGMENT_DURATION);
-    session.needsVideoTranscode = needsVideoTranscode;
-    session.audioStreamCount = audioStreams.length;
-    session.audioStreamsData = audioStreams;
-    session.currentStartSegment = 0;
-    session.lastGeneratedSegment = -1;
-    session.seekLock = false;
-
-    console.log(`Probe ${sessionId}: duration=${duration.toFixed(1)}s, ${session.totalSegments} segments, video=${videoCodec}${needsVideoTranscode ? '->transcode' : '->copy'}, ${audioStreams.length} audio, ${subtitleStreams.length} subs`);
-    audioStreams.forEach((a, i) => console.log(`  Audio #${i}: codec=${a.codec_name} lang=${a.tags?.language || 'und'} title="${a.tags?.title || ''}"`));
-
-    // Store audio track info for the client
-    session.audioInfo = audioStreams.map((a, i) => ({
-      index: i,
-      codec: a.codec_name,
-      lang: a.tags?.language || 'und',
-      title: a.tags?.title || a.tags?.language || `Track ${i + 1}`
-    }));
-
-    // Extract subtitles as separate VTT files (non-blocking)
-    extractSubtitles(sessionId, session, url, referer, subtitleStreams);
-
-    // Write master playlist with audio groups
-    writeMasterPlaylist(session, audioStreams);
-
-    // Start FFmpeg from the beginning (segment 0)
-    spawnRemuxProcess(sessionId, session, 0);
-
-    session.state = 'ready';
-    session.masterReady = true;
-  }).catch((err) => {
-    session.state = 'error';
-    session.error = 'Probe failed: ' + err.message;
-    console.error(`Remux ${sessionId}: probe failed:`, err.message);
-  });
-}
-
-// Spawn FFmpeg starting from a specific segment number (used for initial start and seek-restart)
-function spawnRemuxProcess(sessionId, session, startSegment) {
-  const seekTime = startSegment * session.segmentDuration;
-
-  const args = [];
-  const headerStr = session.referer
-    ? `Referer: ${session.referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
-    : `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`;
-
-  // Fast input-level seek (before -i)
-  if (seekTime > 0) {
-    args.push('-ss', String(seekTime));
-  }
+  // Fast seek before input
+  if (startTime > 0) args.push('-ss', String(startTime));
 
   args.push('-headers', headerStr);
   args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
-  args.push('-i', session.url);
+  args.push('-i', url);
 
-  // Video output
-  args.push('-map', '0:v:0');
-  if (session.needsVideoTranscode) {
-    // Force 8-bit 4:2:0 output — required for 10-bit HEVC/HDR input
+  // Map video + selected audio
+  args.push('-map', '0:v:0', '-map', `0:a:${audioTrack}?`);
+
+  // Video encoding
+  if (metadata.needsTranscode) {
     args.push('-pix_fmt', 'yuv420p');
-    if (hwEncoder && !session.hwFailed) {
-      // Hardware encoding — much faster than CPU
+    if (hwEncoder) {
       args.push('-c:v', hwEncoder.name);
       if (hwEncoder.type === 'NVENC') {
-        args.push('-preset', 'p2', '-tune', 'ull', '-cq', '25', '-bf', '0');
+        args.push('-preset', 'p4', '-cq', '23', '-bf', '0');
       } else if (hwEncoder.type === 'QuickSync') {
-        args.push('-preset', 'veryfast', '-global_quality', '25', '-bf', '0');
+        args.push('-preset', 'veryfast', '-global_quality', '23', '-bf', '0');
       } else if (hwEncoder.type === 'AMF') {
         args.push('-quality', 'speed', '-bf', '0');
       } else if (hwEncoder.type === 'VideoToolbox') {
         args.push('-q:v', '65', '-bf', '0');
       }
     } else {
-      // CPU fallback — TV-safe profile, zero latency for fast first segment
       args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency');
-      args.push('-crf', '23', '-profile:v', 'high', '-level', '4.1');
-      args.push('-bf', '0');
+      args.push('-crf', '23', '-profile:v', 'high', '-level', '4.1', '-bf', '0');
     }
-    args.push('-force_key_frames', 'expr:gte(t,n_forced*' + session.segmentDuration + ')');
   } else {
     args.push('-c:v', 'copy');
   }
-  args.push('-an');
-  args.push('-f', 'hls', '-hls_time', String(session.segmentDuration), '-hls_list_size', '0');
-  args.push('-hls_flags', 'temp_file');
-  args.push('-start_number', String(startSegment));
-  args.push('-hls_segment_filename', path.join(session.dir, 'v_%04d.ts'));
-  args.push(path.join(session.dir, '_int_v.m3u8'));
 
-  // Audio outputs (one per track)
-  (session.audioStreamsData || []).forEach((audio, i) => {
-    args.push('-map', `0:a:${i}`);
-    if (audio.codec_name === 'aac') {
-      args.push('-c:a', 'copy');
-    } else {
-      args.push('-c:a', 'aac', '-ac', '2', '-b:a', '192k');
-    }
-    args.push('-vn');
-    args.push('-f', 'hls', '-hls_time', String(session.segmentDuration), '-hls_list_size', '0');
-    args.push('-hls_flags', 'temp_file');
-    args.push('-start_number', String(startSegment));
-    args.push('-hls_segment_filename', path.join(session.dir, `a${i}_%04d.ts`));
-    args.push(path.join(session.dir, `_int_a${i}.m3u8`));
-  });
-
-  const useHw = session.needsVideoTranscode && hwEncoder && !session.hwFailed;
-  const encLabel = session.needsVideoTranscode ? (useHw ? hwEncoder.name : 'libx264') : 'copy';
-  console.log(`Remux ${sessionId}: FFmpeg start seg=${startSegment} (${seekTime}s), video=${encLabel}, ${session.audioStreamCount} audio`);
-  console.log(`Remux ${sessionId}: FFmpeg cmd: "${ffmpegPath}" ${args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`);
-
-  const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  session.remuxProc = proc;
-  session.remuxComplete = false;
-  session.ffmpegDead = false;
-  session.currentStartSegment = startSegment;
-  session.ffmpegStartTime = Date.now();
-  session.lastGeneratedSegment = startSegment - 1;
-  session.hasOutput = false;
-
-  let stderrLog = '';
-
-  proc.stderr.on('data', (data) => {
-    const msg = data.toString();
-    // Keep last 2KB of stderr for diagnostics
-    stderrLog = (stderrLog + msg).slice(-2048);
-    const timeMatch = msg.match(/time=(\d+):(\d+):(\d+)\.(\d+)/);
-    if (timeMatch) {
-      session.hasOutput = true;
-      const h = parseInt(timeMatch[1]);
-      const m = parseInt(timeMatch[2]);
-      const s = parseInt(timeMatch[3]);
-      const totalSeconds = h * 3600 + m * 60 + s + seekTime;
-      const estSegment = Math.floor(totalSeconds / session.segmentDuration);
-      if (estSegment > session.lastGeneratedSegment) {
-        session.lastGeneratedSegment = estSegment;
-      }
-    }
-  });
-
-  proc.on('close', (code) => {
-    // Only update if this is still the active process (not a killed old one)
-    if (session.remuxProc === proc) {
-      if (code === 0) {
-        session.remuxComplete = true;
-        session.lastGeneratedSegment = session.totalSegments - 1;
-        console.log(`Remux ${sessionId}: FFmpeg complete`);
-      } else if (code !== null && !session.hasOutput && useHw && !session.hwFailed) {
-        // Hardware encoder failed before producing any output — fallback to libx264
-        console.warn(`Remux ${sessionId}: hardware encoder failed (code ${code}), retrying with libx264`);
-        console.warn(`  stderr: ${stderrLog.slice(-500)}`);
-        session.hwFailed = true;
-        spawnRemuxProcess(sessionId, session, startSegment);
-      } else if (code !== null && code !== 255) {
-        // FFmpeg crashed mid-stream — mark dead so segment requests can trigger restart
-        // Do NOT set remuxComplete=true (that would permanently kill all segment requests)
-        session.ffmpegDead = true;
-        console.warn(`Remux ${sessionId}: FFmpeg crashed (code ${code}), will restart on next segment request`);
-        console.warn(`  stderr: ${stderrLog.slice(-500)}`);
-      } else {
-        // Killed by us (SIGTERM = code null or 255) — normal during seek restart
-        console.log(`Remux ${sessionId}: FFmpeg killed (seek restart)`);
-      }
-    }
-  });
-
-  proc.on('error', (err) => {
-    if (session.remuxProc === proc) {
-      console.warn(`Remux ${sessionId}: FFmpeg spawn error:`, err.message);
-      session.ffmpegDead = true;
-    }
-  });
-}
-
-// Kill current FFmpeg and restart from a new segment position (Jellyfin-style seek)
-function restartRemuxFromSegment(sessionId, session, targetSegment) {
-  if (session.seekLock) return;
-  session.seekLock = true;
-  session.ffmpegDead = false;
-
-  console.log(`Remux ${sessionId}: seek restart -> segment ${targetSegment} (${targetSegment * session.segmentDuration}s)`);
-
-  if (session.remuxProc && !session.remuxProc.killed) {
-    session.remuxProc.kill('SIGTERM');
+  // Audio encoding
+  const audioInfo = metadata.audioTracks[audioTrack];
+  if (audioInfo && !audioInfo.needsTranscode) {
+    args.push('-c:a', 'copy');
+  } else {
+    args.push('-c:a', 'aac', '-b:a', '192k', '-ac', '2');
   }
 
-  // Small delay to let the process die cleanly before respawning
-  setTimeout(() => {
-    spawnRemuxProcess(sessionId, session, targetSegment);
-    session.seekLock = false;
-  }, 300);
-}
+  // Fragmented MP4 output piped to stdout
+  args.push(
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-frag_duration', '500000',
+    '-f', 'mp4',
+    'pipe:1'
+  );
 
-function cleanupSession(sessionId) {
-  const session = remuxSessions.get(sessionId);
-  if (!session) return;
-  if (session.remuxProc && !session.remuxProc.killed) {
-    session.remuxProc.kill('SIGTERM');
-    setTimeout(() => {
-      if (session.remuxProc && !session.remuxProc.killed) session.remuxProc.kill('SIGKILL');
-    }, 5000);
-  }
-  try { fs.rmSync(session.dir, { recursive: true, force: true }); } catch (e) {}
-  remuxSessions.delete(sessionId);
-  console.log(`Remux ${sessionId}: cleaned up`);
+  return args;
 }
-
-function cleanupRoomSessions(roomId) {
-  for (const [id, session] of remuxSessions) {
-    if (session.roomId === roomId) cleanupSession(id);
-  }
-}
-
-// Periodic cleanup: idle >30min or >6hr old
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of remuxSessions) {
-    if (now - session.lastAccess > 30 * 60 * 1000 || now - session.createdAt > 6 * 60 * 60 * 1000) {
-      console.log(`Remux GC: cleaning ${id}`);
-      cleanupSession(id);
-    }
-  }
-}, 60 * 1000);
 
 // --- API endpoints ---
 
@@ -548,240 +335,159 @@ app.get('/api/streams/:type/:id', async (req, res) => {
   }
 });
 
-// --- Remux endpoints ---
-app.get('/remux', (req, res) => {
-  if (!ffmpegAvailable) {
-    return res.json({ error: 'FFmpeg not available', fallback: true });
-  }
-  const targetUrl = req.query.url;
-  const customReferer = req.query.referer || '';
-  const roomId = req.query.room || '';
-  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
+// --- Transcode endpoints ---
 
-  // Reuse existing session for same URL+room
-  for (const [id, session] of remuxSessions) {
-    if (session.url === targetUrl && session.roomId === roomId && session.state !== 'error') {
-      session.lastAccess = Date.now();
-      return res.json({ sessionId: id, url: `/remux/${id}/master.m3u8`, state: session.state, ready: session.masterReady });
+// Probe stream metadata
+app.get('/transcode/metadata', async (req, res) => {
+  if (!ffmpegAvailable) return res.status(503).json({ error: 'FFmpeg not available' });
+  const url = req.query.url;
+  const referer = req.query.referer || '';
+  if (!url) return res.status(400).json({ error: 'Missing url parameter' });
+  try {
+    const metadata = await getOrProbeMetadata(url, referer);
+    res.json(metadata);
+  } catch (e) {
+    console.error('[Transcode] Probe failed:', e.message);
+    res.status(500).json({ error: 'Probe failed: ' + e.message });
+  }
+});
+
+// Stream transcoded/remuxed fragmented MP4
+app.get('/transcode/stream', async (req, res) => {
+  if (!ffmpegAvailable) return res.status(503).send('FFmpeg not available');
+  const url = req.query.url;
+  const referer = req.query.referer || '';
+  const startTime = parseFloat(req.query.t) || 0;
+  const audioTrack = parseInt(req.query.audio) || 0;
+  if (!url) return res.status(400).send('Missing url parameter');
+
+  const streamKey = getStreamKey(url);
+
+  // Kill existing stream for this URL
+  const existing = transcodeStreams.get(streamKey);
+  if (existing && existing.process && !existing.process.killed) {
+    existing.process.kill('SIGKILL');
+    transcodeStreams.delete(streamKey);
+  }
+
+  let metadata;
+  try {
+    metadata = await getOrProbeMetadata(url, referer);
+  } catch (e) {
+    console.error('[Transcode] Probe failed:', e.message);
+    return res.status(500).send('Probe failed');
+  }
+
+  if (!metadata.duration || metadata.duration <= 0) {
+    return res.status(500).send('Could not determine duration');
+  }
+
+  const args = buildTranscodeArgs(url, referer, startTime, audioTrack, metadata);
+  const encLabel = metadata.needsTranscode ? (hwEncoder ? hwEncoder.name : 'libx264') : 'copy';
+  console.log(`[Transcode] Start: t=${startTime}s audio=${audioTrack} video=${encLabel}`);
+
+  const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let hasOutput = false;
+  let hwFailed = false;
+
+  transcodeStreams.set(streamKey, { process: proc, url, startTime });
+
+  res.set('Content-Type', 'video/mp4');
+  res.set('Cache-Control', 'no-cache');
+  res.set('Transfer-Encoding', 'chunked');
+  res.set('X-Duration', String(metadata.duration));
+  res.set('X-Start-Time', String(startTime));
+
+  proc.stdout.on('data', (chunk) => {
+    hasOutput = true;
+    if (!res.writableEnded) res.write(chunk);
+  });
+
+  proc.stderr.on('data', (data) => {
+    const msg = data.toString();
+    if (msg.includes('Error') || msg.includes('Invalid')) {
+      console.error('[Transcode] FFmpeg:', msg.trim().substring(0, 200));
     }
-  }
+  });
 
-  if (remuxSessions.size >= MAX_REMUX_SESSIONS) {
-    return res.json({ error: 'Too many active remux sessions', fallback: true });
-  }
+  proc.on('close', (code) => {
+    transcodeStreams.delete(streamKey);
+    // Retry with software encoder if hardware failed
+    if (code !== 0 && !hasOutput && metadata.needsTranscode && hwEncoder && !hwFailed) {
+      console.log('[Transcode] Hardware encoder failed, retrying with libx264...');
+      hwFailed = true;
+      const swArgs = buildTranscodeArgs(url, referer, startTime, audioTrack, { ...metadata, needsTranscode: true });
+      // Replace hardware encoder args with libx264
+      const nvIdx = swArgs.indexOf(hwEncoder.name);
+      if (nvIdx !== -1) {
+        // Remove hwaccel args
+        const hwIdx = swArgs.indexOf('-hwaccel');
+        if (hwIdx !== -1) swArgs.splice(hwIdx, 2);
+        // Replace encoder
+        swArgs[swArgs.indexOf(hwEncoder.name)] = 'libx264';
+        // Add libx264 specific args
+        const encIdx = swArgs.indexOf('libx264');
+        swArgs.splice(encIdx + 1, 0, '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '23', '-bf', '0');
+        // Remove hw-specific args after encoder (preset, cq, etc already in buildTranscodeArgs)
+      }
+      const swProc = spawn(ffmpegPath, swArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+      transcodeStreams.set(streamKey, { process: swProc, url, startTime });
+      swProc.stdout.on('data', (chunk) => { if (!res.writableEnded) res.write(chunk); });
+      swProc.stderr.on('data', () => {});
+      swProc.on('close', () => { transcodeStreams.delete(streamKey); if (!res.writableEnded) res.end(); });
+      req.on('close', () => { swProc.kill('SIGKILL'); transcodeStreams.delete(streamKey); });
+      return;
+    }
+    if (!res.writableEnded) res.end();
+  });
 
-  const sessionId = crypto.randomBytes(8).toString('hex');
-  const sessionDir = path.join(REMUX_DIR, sessionId);
-  try { fs.mkdirSync(sessionDir, { recursive: true }); }
-  catch (e) { return res.status(500).json({ error: 'Failed to create session directory' }); }
+  proc.on('error', (err) => {
+    console.error('[Transcode] FFmpeg spawn error:', err.message);
+    transcodeStreams.delete(streamKey);
+    if (!res.headersSent) res.status(500).send('FFmpeg error');
+  });
 
-  const session = {
-    process: null, dir: sessionDir, url: targetUrl, referer: customReferer,
-    roomId, createdAt: Date.now(), lastAccess: Date.now(),
-    state: 'starting', error: null, probeData: null, masterReady: false
-  };
-  remuxSessions.set(sessionId, session);
-  startRemux(sessionId, session, targetUrl, customReferer);
-
-  res.json({ sessionId, url: `/remux/${sessionId}/master.m3u8`, state: 'starting', ready: false });
-});
-
-app.get('/remux/:sessionId/status', (req, res) => {
-  const session = remuxSessions.get(req.params.sessionId);
-  if (!session) {
-    console.log(`Status check: session ${req.params.sessionId} NOT FOUND`);
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  session.lastAccess = Date.now();
-  res.json({ state: session.state, ready: session.masterReady, error: session.error });
-});
-
-app.get('/remux/:sessionId/info', (req, res) => {
-  const session = remuxSessions.get(req.params.sessionId);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  session.lastAccess = Date.now();
-  res.json({
-    audio: (session.audioInfo || []),
-    subtitles: (session.subtitles || []).map(s => ({
-      index: s.index,
-      lang: s.lang,
-      title: s.title,
-      url: `/remux/${req.params.sessionId}/${s.file}`,
-      ready: s.ready
-    })),
-    duration: session.duration || 0,
-    remuxComplete: session.remuxComplete || false
+  req.on('close', () => {
+    if (!proc.killed) proc.kill('SIGKILL');
+    transcodeStreams.delete(streamKey);
   });
 });
 
-// Client-initiated seek: tells the server to restart FFmpeg at a specific segment
-app.get('/remux/:sessionId/seek', (req, res) => {
-  const session = remuxSessions.get(req.params.sessionId);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  session.lastAccess = Date.now();
+// Extract single subtitle track as WebVTT
+app.get('/transcode/subtitles', (req, res) => {
+  if (!ffmpegAvailable) return res.status(503).send('FFmpeg not available');
+  const url = req.query.url;
+  const referer = req.query.referer || '';
+  const track = parseInt(req.query.track) || 0;
+  if (!url) return res.status(400).send('Missing url parameter');
 
-  const segment = parseInt(req.query.segment);
-  if (isNaN(segment) || segment < 0) return res.status(400).json({ error: 'Invalid segment' });
+  const headerStr = referer
+    ? `Referer: ${referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
+    : `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`;
 
-  // Already on disk — no restart needed
-  const segFile = path.join(session.dir, `v_${String(segment).padStart(4, '0')}.ts`);
-  if (fs.existsSync(segFile)) {
-    return res.json({ status: 'ready', segment });
-  }
+  const args = [
+    '-hide_banner', '-loglevel', 'error',
+    '-headers', headerStr,
+    '-i', url,
+    '-map', `0:s:${track}`,
+    '-c:s', 'webvtt',
+    '-f', 'webvtt',
+    'pipe:1'
+  ];
 
-  // FFmpeg is already producing nearby — no restart needed
-  if (!session.ffmpegDead && !session.seekLock &&
-      segment >= session.currentStartSegment &&
-      segment <= session.lastGeneratedSegment + 30) {
-    return res.json({ status: 'pending', segment });
-  }
-
-  // Restart FFmpeg at the target position
-  restartRemuxFromSegment(req.params.sessionId, session, segment);
-  return res.json({ status: 'restarting', segment });
-});
-
-app.get('/remux/:sessionId/:file', (req, res) => {
-  const session = remuxSessions.get(req.params.sessionId);
-  if (!session) return res.status(404).send('Session not found');
-  session.lastAccess = Date.now();
-
-  const safeName = path.basename(req.params.file);
-
-  res.set('Access-Control-Allow-Origin', '*');
+  const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  res.set('Content-Type', 'text/vtt');
   res.set('Cache-Control', 'no-cache');
-
-  // Master playlist — serve from disk (written once during probe)
-  if (safeName === 'master.m3u8') {
-    const filePath = path.join(session.dir, 'master.m3u8');
-    if (!fs.existsSync(filePath)) return res.status(404).send('Not ready');
-    res.set('Content-Type', 'application/vnd.apple.mpegurl');
-    return res.send(fs.readFileSync(filePath, 'utf8'));
-  }
-
-  // VOD playlists — generated dynamically with full duration + ENDLIST
-  if (safeName.endsWith('.m3u8')) {
-    if (!session.duration) return res.status(404).send('Not ready');
-    let content = null;
-    if (safeName === 'video.m3u8') {
-      content = generateVodPlaylist(session.totalSegments, session.segmentDuration, session.duration, 'v_');
-    } else {
-      const audioMatch = safeName.match(/^a(\d+)\.m3u8$/);
-      if (audioMatch) {
-        const idx = parseInt(audioMatch[1]);
-        if (idx < session.audioStreamCount) {
-          content = generateVodPlaylist(session.totalSegments, session.segmentDuration, session.duration, `a${idx}_`);
-        }
-      }
-    }
-    if (content) {
-      res.set('Content-Type', 'application/vnd.apple.mpegurl');
-      res.set('Content-Length', Buffer.byteLength(content));
-      return res.send(content);
-    }
-    return res.status(404).send('Playlist not found');
-  }
-
-  // Segment files (.ts) — serve from disk or trigger seek-restart
-  if (safeName.endsWith('.ts')) {
-    const filePath = path.join(session.dir, safeName);
-
-    // If segment already exists on disk, serve it immediately
-    if (fs.existsSync(filePath)) {
-      return serveSegmentFile(filePath, res);
-    }
-
-    // Parse segment number from filename (v_0042.ts or a0_0042.ts)
-    const segMatch = safeName.match(/^(?:v|a\d+)_(\d{4})\.ts$/);
-    if (!segMatch) return res.status(404).send('Invalid segment');
-    const segNum = parseInt(segMatch[1], 10);
-
-    if (segNum >= (session.totalSegments || Infinity)) {
-      return res.status(404).send('Out of range');
-    }
-
-    // Only restart FFmpeg from segment requests if it crashed (ffmpegDead).
-    // Seek-based restarts are handled by the /seek endpoint called by the client.
-    // This prevents HLS.js buffer-ahead requests from triggering unwanted restarts.
-    const isVideoSegment = safeName.startsWith('v_');
-    if (isVideoSegment && !session.seekLock && session.ffmpegDead) {
-      restartRemuxFromSegment(req.params.sessionId, session, segNum);
-    }
-
-    // Wait for the segment to appear on disk (temp_file flag ensures it's complete)
-    const startWait = Date.now();
-    const waitForSeg = () => {
-      if (fs.existsSync(filePath)) {
-        return serveSegmentFile(filePath, res);
-      }
-      // If FFmpeg finished cleanly and segment still missing, it's never coming
-      if (session.remuxComplete && !session.seekLock) {
-        return res.status(404).send('Segment not available');
-      }
-      if (Date.now() - startWait > 45000) {
-        return res.status(404).send('Timeout');
-      }
-      if (!remuxSessions.has(req.params.sessionId)) {
-        return res.status(404).send('Session ended');
-      }
-      setTimeout(waitForSeg, 300);
-    };
-    waitForSeg();
-    return;
-  }
-
-  // Other files (subtitles .vtt)
-  const filePath = path.join(session.dir, safeName);
-  if (fs.existsSync(filePath)) {
-    if (safeName.endsWith('.vtt')) res.set('Content-Type', 'text/vtt');
-    try {
-      const stat = fs.statSync(filePath);
-      res.set('Content-Length', stat.size);
-      fs.createReadStream(filePath).pipe(res).on('error', () => {
-        if (!res.headersSent) res.status(500).end();
-      });
-    } catch (e) {
-      if (!res.headersSent) res.status(404).send('Read error');
-    }
-  } else if (safeName.endsWith('.vtt') && (session.state === 'starting' || session.state === 'ready')) {
-    // Subtitle still being extracted — wait briefly
-    let retries = 0;
-    const waitForVtt = () => {
-      if (fs.existsSync(filePath)) {
-        res.set('Content-Type', 'text/vtt');
-        try {
-          const stat = fs.statSync(filePath);
-          res.set('Content-Length', stat.size);
-          fs.createReadStream(filePath).pipe(res);
-        } catch (e) {
-          if (!res.headersSent) res.status(404).send('Read error');
-        }
-        return;
-      }
-      retries++;
-      if (retries < 10) setTimeout(waitForVtt, 300);
-      else res.status(404).send('Not found');
-    };
-    waitForVtt();
-  } else {
-    res.status(404).send('Not found');
-  }
+  proc.stdout.pipe(res);
+  proc.on('error', () => { if (!res.headersSent) res.status(500).send('Subtitle extraction failed'); });
+  proc.on('close', (code) => { if (code !== 0 && !res.headersSent) res.status(500).send('Subtitle extraction failed'); });
+  req.on('close', () => { if (!proc.killed) proc.kill('SIGKILL'); });
 });
 
-function serveSegmentFile(filePath, res) {
-  try {
-    const stat = fs.statSync(filePath);
-    if (!res.headersSent) {
-      res.set('Content-Type', 'video/MP2T');
-      res.set('Content-Length', stat.size);
-      fs.createReadStream(filePath).pipe(res).on('error', () => {
-        if (!res.headersSent) res.status(500).end();
-      });
-    }
-  } catch (e) {
-    if (!res.headersSent) res.status(404).send('Read error');
-  }
-}
+// Cleanup transcode streams on exit
+process.on('SIGINT', () => {
+  transcodeStreams.forEach(s => { if (s.process && !s.process.killed) s.process.kill('SIGKILL'); });
+});
 
 // CORS proxy for HLS streams
 app.get('/proxy', (req, res) => {
@@ -1153,17 +859,14 @@ io.on('connection', (socket) => {
     const room = rooms.get(socket.roomId);
     if (room) {
       room.videoUrl = data.url;
+      room.videoReferer = data.referer || '';
+      room.isTranscode = !!data.transcode;
       room.currentTime = 0;
       room.playing = false;
       room.audioTracks = null;
       room.subtitleTracks = null;
       room.selectedAudioTrack = null;
       room.selectedSubtitleTrack = null;
-    }
-    // Only cleanup remux sessions if the new URL is NOT from a remux in this room
-    const isRemuxUrl = data.url && data.url.startsWith('/remux/');
-    if (!isRemuxUrl) {
-      cleanupRoomSessions(socket.roomId);
     }
     socket.to(socket.roomId).emit('set-video', data);
   });
@@ -1272,7 +975,6 @@ io.on('connection', (socket) => {
       // Clean up empty rooms
       if (count === 0) {
         rooms.delete(socket.roomId);
-        cleanupRoomSessions(socket.roomId);
       }
     }
     console.log('User disconnected:', socket.id);
