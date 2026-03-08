@@ -975,11 +975,69 @@ app.get('/proxy', (req, res) => {
       return;
     }
 
-    // Rewrite m3u8 playlists to route segments through proxy too
+    // If MediaFlow returned a playlist content-type, /proxy/stream won't deliver
+    // the body. Abort and re-fetch through the HLS manifest endpoint.
     const contentType = proxyRes.headers['content-type'] || '';
-    const isPlaylist = targetUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('apple');
+    const isPlaylist = contentType.includes('mpegurl') || contentType.includes('apple');
+
+    if (MEDIAFLOW_URL && isPlaylist) {
+      proxyRes.destroy();
+      proxyReq.destroy();
+      console.log('Playlist detected from /proxy/stream, re-fetching via HLS endpoint:', targetUrl.substring(0, 100));
+      const mfHlsUrl = new URL(MEDIAFLOW_URL + '/proxy/hls/manifest.m3u8');
+      mfHlsUrl.searchParams.set('d', targetUrl);
+      if (MEDIAFLOW_API_PASSWORD) mfHlsUrl.searchParams.set('api_password', MEDIAFLOW_API_PASSWORD);
+      const hlsClient = mfHlsUrl.protocol === 'https:' ? https : http;
+      const hlsReq = hlsClient.get(mfHlsUrl.href, { headers: { 'Accept-Encoding': 'identity' } }, (hlsRes) => {
+        if (hlsRes.statusCode >= 400) {
+          hlsRes.resume();
+          if (!res.headersSent) res.status(hlsRes.statusCode).send('Playlist fetch failed');
+          return;
+        }
+        let body = '';
+        hlsRes.setEncoding('utf8');
+        hlsRes.on('data', (chunk) => { body += chunk; });
+        hlsRes.on('end', () => {
+          console.log('HLS re-fetch body length:', body.length);
+          if (res.headersSent) return;
+          if (!body.trim().startsWith('#EXTM3U')) {
+            res.set('Content-Type', contentType);
+            res.send(body);
+            return;
+          }
+          // Re-rewrite MediaFlow URLs to our proxy
+          const mfOrigin = new URL(MEDIAFLOW_URL).origin;
+          const mfEscaped = mfOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const refParam = customReferer ? '&referer=' + encodeURIComponent(customReferer) : '';
+          const rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
+            try {
+              const u = new URL(mfLink);
+              const originalUrl = u.searchParams.get('d');
+              if (originalUrl) return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam;
+            } catch (e) {}
+            return mfLink;
+          });
+          res.set('Content-Type', 'application/vnd.apple.mpegurl');
+          res.send(rewritten);
+        });
+        hlsRes.on('error', (err) => {
+          console.error('HLS re-fetch error:', err.message);
+          if (!res.headersSent) res.status(502).send('Playlist read error');
+        });
+      });
+      hlsReq.on('error', (err) => {
+        console.error('HLS re-fetch request error:', err.message);
+        if (!res.headersSent) res.status(502).send('Playlist fetch failed');
+      });
+      hlsReq.setTimeout(15000, () => {
+        hlsReq.destroy();
+        if (!res.headersSent) res.status(504).send('Playlist fetch timeout');
+      });
+      return;
+    }
 
     if (isPlaylist) {
+      // Non-MediaFlow playlist handling
       let body = '';
       proxyRes.setEncoding('utf8');
       proxyRes.on('data', (chunk) => { body += chunk; });
