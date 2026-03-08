@@ -1085,7 +1085,7 @@ app.get('/proxy', (req, res) => {
       }
     });
 
-    proxyReq.setTimeout(MEDIAFLOW_URL ? 30000 : 15000, () => {
+    proxyReq.setTimeout(MEDIAFLOW_URL ? 60000 : 15000, () => {
       proxyReq.destroy();
       console.error('Proxy timeout:', targetUrl.substring(0, 80));
       if (!res.headersSent) res.status(504).send('Proxy timeout');

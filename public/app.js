@@ -911,9 +911,9 @@ function loadVideo(url, broadcast) {
         manifestLoadingMaxRetry: 6,
         levelLoadingTimeOut: 30000,
         levelLoadingMaxRetry: 6,
-        fragLoadingTimeOut: 45000,
-        fragLoadingMaxRetry: 8,
-        fragLoadingMaxRetryTimeout: 15000
+        fragLoadingTimeOut: 120000,
+        fragLoadingMaxRetry: 10,
+        fragLoadingMaxRetryTimeout: 30000
       };
       hls = new Hls(hlsConfig);
       hls.loadSource(url);
