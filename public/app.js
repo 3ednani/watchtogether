@@ -1418,10 +1418,23 @@ function showSpinner() {
 function hideSpinner() {
   videoSpinner.classList.add('hidden');
 }
-video.addEventListener('waiting', showSpinner);
+video.addEventListener('waiting', function() {
+  showSpinner();
+  // Freeze wall clock during buffering
+  if (currentTranscode && transcodeWallStart > 0) {
+    transcodeTimeOffset = getRealTime();
+    transcodeWallStart = 0;
+  }
+});
 video.addEventListener('seeking', showSpinner);
 video.addEventListener('canplay', hideSpinner);
-video.addEventListener('playing', hideSpinner);
+video.addEventListener('playing', function() {
+  hideSpinner();
+  // Resume wall clock after buffering
+  if (currentTranscode && transcodeWallStart === 0 && !video.paused) {
+    transcodeWallStart = Date.now();
+  }
+});
 video.addEventListener('seeked', hideSpinner);
 video.addEventListener('error', hideSpinner);
 
