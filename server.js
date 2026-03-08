@@ -929,8 +929,12 @@ app.get('/proxy', (req, res) => {
           rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
             try {
               const u = new URL(mfLink);
-              const originalUrl = u.searchParams.get('d');
+              let originalUrl = u.searchParams.get('d');
               if (originalUrl) {
+                // Resolve relative URLs (like /storage/enc.key) against the target
+                if (!originalUrl.startsWith('http')) {
+                  originalUrl = new URL(originalUrl, targetUrl).href;
+                }
                 return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint;
               }
             } catch (e) {}
@@ -1037,8 +1041,11 @@ app.get('/proxy', (req, res) => {
             const rewritten = body.replace(new RegExp(mfEscaped + '/proxy/[^\\s"\\n]*', 'g'), (mfLink) => {
               try {
                 const u = new URL(mfLink);
-                const originalUrl = u.searchParams.get('d');
+                let originalUrl = u.searchParams.get('d');
                 if (originalUrl) {
+                  if (!originalUrl.startsWith('http')) {
+                    originalUrl = new URL(originalUrl, targetUrl).href;
+                  }
                   return '/proxy?url=' + encodeURIComponent(originalUrl) + refParam + playlistHint2;
                 }
               } catch (e) {}
