@@ -848,8 +848,14 @@ app.get('/proxy', (req, res) => {
         console.log('Proxy binary:', proxyRes.statusCode, targetUrl.substring(0, 100));
       // Forward status code (206 for partial content / range requests)
       res.status(proxyRes.statusCode);
-      if (proxyRes.headers['content-type']) {
-        res.set('Content-Type', proxyRes.headers['content-type']);
+      // Override misleading content-types from anti-adblock streams that disguise
+      // segments as image/gif, text/vtt, etc. Forcing a neutral binary type stops
+      // the browser from misinterpreting the bytes (e.g. UTF-8 decoding text/*).
+      const upstreamCt = proxyRes.headers['content-type'] || '';
+      if (/^(image|text)\//i.test(upstreamCt)) {
+        res.set('Content-Type', 'application/octet-stream');
+      } else if (upstreamCt) {
+        res.set('Content-Type', upstreamCt);
       }
       if (proxyRes.headers['content-length']) {
         res.set('Content-Length', proxyRes.headers['content-length']);
