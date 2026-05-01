@@ -83,6 +83,10 @@ var streamListEl = document.getElementById('stream-list');
 var streamLoading = document.getElementById('stream-loading');
 var streamEmpty = document.getElementById('stream-empty');
 
+// Paste-link DOM
+var inputLink = document.getElementById('input-link');
+var btnLoadLink = document.getElementById('btn-load-link');
+
 // Settings DOM
 var btnSettings = document.getElementById('btn-settings');
 var settingsOverlay = document.getElementById('settings-overlay');
@@ -432,6 +436,23 @@ btnSearch.addEventListener('click', function() {
 });
 inputSearch.addEventListener('keydown', function(e) {
   if (e.key === 'Enter') btnSearch.click();
+});
+
+// --- Paste Link ---
+btnLoadLink.addEventListener('click', function() {
+  var url = inputLink.value.trim();
+  if (!url) return;
+  if (!/^https?:\/\//i.test(url)) {
+    showToast('Link must start with http:// or https://');
+    return;
+  }
+  searchResults.classList.add('hidden');
+  contentDetail.classList.add('hidden');
+  inputLink.value = '';
+  loadVideo(url, true);
+});
+inputLink.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') btnLoadLink.click();
 });
 
 function searchContent(query) {
